@@ -1,4 +1,4 @@
-// ─── CLOSER DEBRIEF — Backend v4 (fully linked) ───────────────────────────────
+// ─── CLOSER DEBRIEF — Backend v5 ─────────────────────────────────────────────
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -19,11 +19,11 @@ const PORT           = process.env.PORT           || 3001;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ─── GAMIFICATION ─────────────────────────────────────────────────────────────
-function computePoints(debrief) {
-  let pts = Math.round((debrief.percentage || 0) / 10);
-  if (debrief.is_closed) pts += 5;
-  if ((debrief.percentage || 0) >= 80) pts += 3;
-  if ((debrief.percentage || 0) >= 90) pts += 2;
+function computePoints(d) {
+  let pts = Math.round((d.percentage || 0) / 10);
+  if (d.is_closed) pts += 5;
+  if ((d.percentage || 0) >= 80) pts += 3;
+  if ((d.percentage || 0) >= 90) pts += 2;
   return pts;
 }
 function computeLevel(p) {
@@ -36,7 +36,7 @@ function computeLevel(p) {
 }
 function computeBadges(debriefs) {
   const badges = [];
-  const total  = debriefs.length;
+  const total = debriefs.length;
   const closed = debriefs.filter(d => d.is_closed).length;
   const perfect = debriefs.filter(d => (d.percentage||0) >= 90).length;
   const avg = total > 0 ? debriefs.reduce((s,d)=>s+(d.percentage||0),0)/total : 0;
@@ -53,8 +53,7 @@ function computeBadges(debriefs) {
 // ─── SCORES PAR SECTION ───────────────────────────────────────────────────────
 function computeSectionScores(sections) {
   const s = sections || {};
-  const score = (pts, max) => Math.round((pts / max) * 5);
-
+  const score = (pts, max) => max > 0 ? Math.round((pts / max) * 5) : 0;
   const d = s.decouverte || {};
   let dPts = 0;
   if (d.douleur_surface === 'oui') dPts++;
@@ -62,25 +61,21 @@ function computeSectionScores(sections) {
   if (Array.isArray(d.couches_douleur)) dPts += Math.min(d.couches_douleur.length, 3);
   if (d.temporalite === 'oui') dPts++;
   if (['oui','artificielle'].includes(d.urgence)) dPts++;
-
   const r = s.reformulation || {};
   let rPts = 0;
   if (['oui','partiel'].includes(r.reformulation)) rPts++;
   if (['oui','moyen'].includes(r.prospect_reconnu)) rPts++;
   if (Array.isArray(r.couches_reformulation)) rPts += Math.min(r.couches_reformulation.length, 3);
-
   const p = s.projection || {};
   let pPts = 0;
   if (p.projection_posee === 'oui') pPts++;
   if (['forte','moyenne'].includes(p.qualite_reponse)) pPts++;
   if (p.deadline_levier === 'oui') pPts++;
-
   const o = s.offre || {};
   let oPts = 0;
   if (['oui','partiel'].includes(o.colle_douleurs)) oPts++;
   if (['oui','moyen'].includes(o.exemples_transformation)) oPts++;
   if (['oui','partiel'].includes(o.duree_justifiee)) oPts++;
-
   const c = s.closing || {};
   let cPts = 0;
   if (c.annonce_prix === 'directe') cPts++;
@@ -88,19 +83,9 @@ function computeSectionScores(sections) {
   if (c.douleur_reancree === 'oui') cPts++;
   if (c.objection_isolee === 'oui') cPts++;
   if (['close','retrograde','relance'].includes(c.resultat_closing)) cPts++;
-
   return {
-    decouverte:          score(dPts, 7),
-    reformulation:       score(rPts, 5),
-    projection:          score(pPts, 3),
-    presentation_offre:  score(oPts, 3),
-    closing:             score(cPts, 5),
-    // Dérivés pour le radar
-    accroche:            0,
-    douleur:             score(dPts, 7),
-    traitement_objections: score(cPts, 5),
-    energie_ton:         0,
-    ecoute_active:       score(rPts, 5),
+    decouverte: score(dPts,7), reformulation: score(rPts,5),
+    projection: score(pPts,3), presentation_offre: score(oPts,3), closing: score(cPts,5),
   };
 }
 
@@ -108,34 +93,32 @@ function computeSectionScores(sections) {
 function authenticate(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Token manquant', code: 'AUTH_REQUIRED' });
-  try {
-    req.user = jwt.verify(auth.split(' ')[1], JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Session expirée, veuillez vous reconnecter', code: 'TOKEN_EXPIRED' });
-  }
+  try { req.user = jwt.verify(auth.split(' ')[1], JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: 'Session expirée, veuillez vous reconnecter', code: 'TOKEN_EXPIRED' }); }
 }
 function requireHOS(req, res, next) {
-  if (req.user.role !== 'head_of_sales')
-    return res.status(403).json({ error: 'Accès réservé aux Head of Sales' });
+  if (req.user.role !== 'head_of_sales') return res.status(403).json({ error: 'Accès réservé aux Head of Sales' });
   next();
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
 function generateInviteCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   return Array.from({ length: 8 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 }
 
-async function getUserTeamIds(userId, role) {
-  if (role === 'closer') return [userId];
-  if (role === 'head_of_sales') {
-    const { data: team } = await supabase.from('teams').select('id').eq('owner_id', userId).single();
-    if (!team) return [userId];
-    const { data: members } = await supabase.from('users').select('id').eq('team_id', team.id);
-    return [userId, ...(members||[]).map(m => m.id)];
+// ─── HELPER : obtenir ou créer l'équipe du HOS ────────────────────────────────
+async function getOrCreateTeam(userId, userName) {
+  let { data: team } = await supabase.from('teams').select('*').eq('owner_id', userId).single();
+  if (!team) {
+    const { data: newTeam } = await supabase.from('teams')
+      .insert({ name: `Équipe de ${userName}`, owner_id: userId })
+      .select().single();
+    if (newTeam) {
+      await supabase.from('users').update({ team_id: newTeam.id }).eq('id', userId);
+      team = newTeam;
+    }
   }
-  return [userId];
+  return team;
 }
 
 async function buildGamification(userId) {
@@ -146,9 +129,7 @@ async function buildGamification(userId) {
   const lastDebrief = list[list.length - 1];
   const pointsEarned = lastDebrief ? computePoints(lastDebrief) : 0;
   return {
-    points,
-    prevPoints,
-    pointsEarned,
+    points, prevPoints, pointsEarned,
     level: computeLevel(points),
     prevLevel: computeLevel(prevPoints),
     badges: computeBadges(list),
@@ -162,13 +143,10 @@ app.post('/api/auth/register', async (req, res) => {
   const { email, password, name, role, invite_code } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'Tous les champs sont requis' });
   if (password.length < 8) return res.status(400).json({ error: 'Mot de passe trop court (8 caractères min)' });
-
   const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
   if (existing) return res.status(409).json({ error: 'Cet email est déjà utilisé' });
 
-  let finalRole = 'closer';
-  let teamId = null;
-
+  let finalRole = 'closer', teamId = null;
   if (role === 'head_of_sales') {
     finalRole = 'head_of_sales';
   } else {
@@ -186,15 +164,10 @@ app.post('/api/auth/register', async (req, res) => {
   if (error) { console.error(error); return res.status(500).json({ error: 'Erreur création compte' }); }
 
   if (finalRole === 'head_of_sales') {
-    const { data: team } = await supabase.from('teams')
-      .insert({ name: `Équipe de ${name}`, owner_id: user.id }).select().single();
-    if (team) await supabase.from('users').update({ team_id: team.id }).eq('id', user.id);
+    await getOrCreateTeam(user.id, user.name);
   }
 
-  const token = jwt.sign(
-    { id: user.id, email: user.email, role: user.role, name: user.name },
-    JWT_SECRET, { expiresIn: '7d' }
-  );
+  const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
   const gamification = await buildGamification(user.id);
   res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role }, gamification });
 });
@@ -205,10 +178,9 @@ app.post('/api/auth/login', async (req, res) => {
   const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
   if (!user || !(await bcrypt.compare(password, user.password)))
     return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-  const token = jwt.sign(
-    { id: user.id, email: user.email, role: user.role, name: user.name },
-    JWT_SECRET, { expiresIn: '7d' }
-  );
+  // Auto-créer l'équipe si HOS sans équipe
+  if (user.role === 'head_of_sales') await getOrCreateTeam(user.id, user.name);
+  const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
   const gamification = await buildGamification(user.id);
   res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role }, gamification });
 });
@@ -216,6 +188,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authenticate, async (req, res) => {
   const { data: user } = await supabase.from('users').select('id,email,name,role').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+  if (user.role === 'head_of_sales') await getOrCreateTeam(user.id, user.name);
   res.json(user);
 });
 
@@ -254,9 +227,15 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 // ─── DEBRIEFS ─────────────────────────────────────────────────────────────────
 app.get('/api/debriefs', authenticate, async (req, res) => {
-  const ids = await getUserTeamIds(req.user.id, req.user.role);
-  const { data, error } = await supabase.from('debriefs').select('*')
-    .in('user_id', ids).order('call_date', { ascending: false });
+  let ids = [req.user.id];
+  if (req.user.role === 'head_of_sales') {
+    const team = await getOrCreateTeam(req.user.id, req.user.name);
+    if (team) {
+      const { data: members } = await supabase.from('users').select('id').eq('team_id', team.id);
+      ids = [req.user.id, ...(members||[]).map(m => m.id)];
+    }
+  }
+  const { data, error } = await supabase.from('debriefs').select('*').in('user_id', ids).order('call_date', { ascending: false });
   if (error) return res.status(500).json({ error: 'Erreur récupération debriefs' });
   res.json(data);
 });
@@ -264,18 +243,16 @@ app.get('/api/debriefs', authenticate, async (req, res) => {
 app.get('/api/debriefs/:id', authenticate, async (req, res) => {
   const { data: debrief } = await supabase.from('debriefs').select('*').eq('id', req.params.id).single();
   if (!debrief) return res.status(404).json({ error: 'Debrief introuvable' });
-  const ids = await getUserTeamIds(req.user.id, req.user.role);
-  if (!ids.includes(debrief.user_id)) return res.status(403).json({ error: 'Accès refusé' });
+  if (req.user.role === 'closer' && debrief.user_id !== req.user.id)
+    return res.status(403).json({ error: 'Accès refusé' });
   res.json(debrief);
 });
 
 app.post('/api/debriefs', authenticate, async (req, res) => {
-  const body = req.body;
-  const scores = computeSectionScores(body.sections);
+  const scores = computeSectionScores(req.body.sections);
   const { data: debrief, error } = await supabase.from('debriefs')
-    .insert({ ...body, user_id: req.user.id, user_name: req.user.name, scores }).select().single();
+    .insert({ ...req.body, user_id: req.user.id, user_name: req.user.name, scores }).select().single();
   if (error) { console.error(error); return res.status(500).json({ error: 'Erreur création debrief' }); }
-  // Retourner le debrief + gamification mise à jour en une seule requête
   const gamification = await buildGamification(req.user.id);
   res.status(201).json({ debrief, gamification });
 });
@@ -292,8 +269,7 @@ app.delete('/api/debriefs/:id', authenticate, async (req, res) => {
 
 // ─── GAMIFICATION ─────────────────────────────────────────────────────────────
 app.get('/api/gamification/me', authenticate, async (req, res) => {
-  const gamification = await buildGamification(req.user.id);
-  res.json(gamification);
+  res.json(await buildGamification(req.user.id));
 });
 
 app.get('/api/gamification/leaderboard', authenticate, async (req, res) => {
@@ -310,20 +286,23 @@ app.get('/api/gamification/leaderboard', authenticate, async (req, res) => {
 });
 
 // ─── TEAM ─────────────────────────────────────────────────────────────────────
-app.get('/api/team', authenticate, requireHOS, async (req, res) => {
-  const { data: team } = await supabase.from('teams').select('*').eq('owner_id', req.user.id).single();
-  if (!team) return res.json({ team: null, members: [], inviteCodes: [] });
+async function buildTeamData(userId, userName) {
+  const team = await getOrCreateTeam(userId, userName);
+  if (!team) return { team: null, members: [], inviteCodes: [] };
 
-  const [{ data: members }, { data: allDebriefs }, { data: inviteCodes }] = await Promise.all([
-    supabase.from('users').select('id,name,email,role,created_at').eq('team_id', team.id).neq('id', req.user.id),
-    supabase.from('debriefs').select('*').in('user_id',
-      (await supabase.from('users').select('id').eq('team_id', team.id).neq('id', req.user.id)).data?.map(u=>u.id) || []
-    ),
-    supabase.from('invite_codes').select('*').eq('team_id', team.id).eq('used', false),
-  ]);
+  const { data: allMembers } = await supabase.from('users').select('id,name,email,role,created_at').eq('team_id', team.id).neq('id', userId);
+  const memberIds = (allMembers||[]).map(m => m.id);
 
-  const membersWithStats = (members||[]).map(m => {
-    const ud = (allDebriefs||[]).filter(d => d.user_id === m.id);
+  let allDebriefs = [];
+  if (memberIds.length > 0) {
+    const { data } = await supabase.from('debriefs').select('*').in('user_id', memberIds);
+    allDebriefs = data || [];
+  }
+
+  const { data: inviteCodes } = await supabase.from('invite_codes').select('*').eq('team_id', team.id).eq('used', false);
+
+  const members = (allMembers||[]).map(m => {
+    const ud = allDebriefs.filter(d => d.user_id === m.id);
     const points = ud.reduce((s,d)=>s+computePoints(d),0);
     const avgScore = ud.length > 0 ? Math.round(ud.reduce((s,d)=>s+(d.percentage||0),0)/ud.length) : 0;
     const chartData = [...ud].sort((a,b)=>new Date(a.call_date)-new Date(b.call_date))
@@ -331,42 +310,53 @@ app.get('/api/team', authenticate, requireHOS, async (req, res) => {
     return { ...m, points, level:computeLevel(points), badges:computeBadges(ud), avgScore, totalDebriefs:ud.length, closed:ud.filter(d=>d.is_closed).length, chartData };
   });
 
-  res.json({ team, members: membersWithStats, inviteCodes: inviteCodes||[] });
+  return { team, members, inviteCodes: inviteCodes||[] };
+}
+
+app.get('/api/team', authenticate, requireHOS, async (req, res) => {
+  res.json(await buildTeamData(req.user.id, req.user.name));
 });
 
-app.post('/api/team/invite', authenticate, requireHOS, async (req, res) => {
-  const { data: team } = await supabase.from('teams').select('id').eq('owner_id', req.user.id).single();
+// Renommer l'équipe
+app.patch('/api/team', authenticate, requireHOS, async (req, res) => {
+  const { name } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Nom requis' });
+  const team = await getOrCreateTeam(req.user.id, req.user.name);
   if (!team) return res.status(404).json({ error: 'Équipe introuvable' });
+  const { data: updated } = await supabase.from('teams').update({ name: name.trim() }).eq('id', team.id).select().single();
+  res.json(updated);
+});
+
+// Générer un code d'invitation
+app.post('/api/team/invite', authenticate, requireHOS, async (req, res) => {
+  const team = await getOrCreateTeam(req.user.id, req.user.name);
+  if (!team) return res.status(500).json({ error: 'Impossible de créer/trouver l\'équipe' });
   const code = generateInviteCode();
   const { data: invite, error } = await supabase.from('invite_codes')
     .insert({ code, team_id: team.id, created_by: req.user.id, used: false }).select().single();
-  if (error) return res.status(500).json({ error: 'Erreur génération code' });
+  if (error) { console.error(error); return res.status(500).json({ error: 'Erreur génération code' }); }
   res.json(invite);
 });
 
+// Supprimer un code d'invitation
+app.delete('/api/team/invite/:id', authenticate, requireHOS, async (req, res) => {
+  await supabase.from('invite_codes').delete().eq('id', req.params.id);
+  res.json({ success: true });
+});
+
+// Retirer un membre
 app.delete('/api/team/members/:id', authenticate, requireHOS, async (req, res) => {
-  const { data: team } = await supabase.from('teams').select('id').eq('owner_id', req.user.id).single();
+  const team = await getOrCreateTeam(req.user.id, req.user.name);
   if (!team) return res.status(404).json({ error: 'Équipe introuvable' });
   await supabase.from('users').update({ team_id: null }).eq('id', req.params.id).eq('team_id', team.id);
   res.json({ success: true });
 });
 
+// Dashboard équipe pour le HOS
 app.get('/api/team/dashboard', authenticate, requireHOS, async (req, res) => {
-  const { data: team } = await supabase.from('teams').select('*').eq('owner_id', req.user.id).single();
-  if (!team) return res.json([]);
-  const { data: members } = await supabase.from('users').select('id,name').eq('team_id', team.id).neq('id', req.user.id);
-  if (!members?.length) return res.json([]);
-  const { data: allDebriefs } = await supabase.from('debriefs').select('*').in('user_id', members.map(m=>m.id));
-  const result = members.map(m => {
-    const ud = (allDebriefs||[]).filter(d => d.user_id === m.id);
-    const points = ud.reduce((s,d)=>s+computePoints(d),0);
-    const avgScore = ud.length > 0 ? Math.round(ud.reduce((s,d)=>s+(d.percentage||0),0)/ud.length) : 0;
-    const chartData = [...ud].sort((a,b)=>new Date(a.call_date)-new Date(b.call_date))
-      .map(d => ({ date:d.call_date, score:Math.round(d.percentage||0), prospect:d.prospect_name }));
-    return { id:m.id, name:m.name, points, level:computeLevel(points), badges:computeBadges(ud), avgScore, totalDebriefs:ud.length, closed:ud.filter(d=>d.is_closed).length, chartData };
-  });
-  res.json(result);
+  const data = await buildTeamData(req.user.id, req.user.name);
+  res.json(data.members);
 });
 
 // ─── DÉMARRAGE ────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`✅ API v4 démarrée sur http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`✅ API v5 démarrée sur http://localhost:${PORT}`));
