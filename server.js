@@ -8,7 +8,7 @@ const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
+app.use(cors());
 app.use(express.json());
 
 // ─── ⚙️ COLLE TES CLÉS ICI ───────────────────────────────────────────────────
