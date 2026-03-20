@@ -219,7 +219,7 @@ app.post('/api/auth/change-password', authenticate, async (req, res) => {
   res.json({ success: true });
 });
 
-
+app.post('/api/auth/reset-password', async (req, res) => {
   const { token, password } = req.body;
   if (!token || !password) return res.status(400).json({ error:'Token et mot de passe requis' });
   if (password.length < 8) return res.status(400).json({ error:'Mot de passe trop court' });
