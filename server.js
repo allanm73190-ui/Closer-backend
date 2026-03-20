@@ -207,7 +207,19 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   res.json({ success:true });
 });
 
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/change-password', authenticate, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Champs requis' });
+  if (newPassword.length < 8) return res.status(400).json({ error: 'Mot de passe trop court' });
+  const { data: user } = await supabase.from('users').select('password').eq('id', req.user.id).single();
+  if (!user || !(await bcrypt.compare(currentPassword, user.password)))
+    return res.status(401).json({ error: 'Mot de passe actuel incorrect' });
+  const hashed = await bcrypt.hash(newPassword, 10);
+  await supabase.from('users').update({ password: hashed }).eq('id', req.user.id);
+  res.json({ success: true });
+});
+
+
   const { token, password } = req.body;
   if (!token || !password) return res.status(400).json({ error:'Token et mot de passe requis' });
   if (password.length < 8) return res.status(400).json({ error:'Mot de passe trop court' });
