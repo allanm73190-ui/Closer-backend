@@ -569,7 +569,10 @@ app.post('/api/zapier/iclosed-deal', async (req, res) => {
       iclosed_id: iclosed_id || null,
     }).select().single();
 
-    if (error) return res.status(500).json({ error: 'Erreur création deal' });
+    if (error) {
+      console.error('Supabase insert error:', JSON.stringify(error));
+      return res.status(500).json({ error: 'Erreur création deal', detail: error.message, code: error.code });
+    }
     res.status(201).json({ action: 'created', deal: data });
 
   } catch(err) {
