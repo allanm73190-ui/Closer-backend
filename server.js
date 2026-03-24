@@ -8,6 +8,7 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
 const SUPABASE_KEY   = process.env.SUPABASE_KEY   || '';
@@ -625,6 +626,46 @@ app.post('/api/zapier/push-deal', authenticate, async (req, res) => {
   }
 });
 
+// ─── DEBRIEF CONFIG ───────────────────────────────────────────────────────────
+// GET  /api/debrief-config         — retourne la config active (ou défaut)
+// PUT  /api/debrief-config         — sauvegarde (HOS seulement)
+// DELETE /api/debrief-config       — reset au défaut (HOS seulement)
+
+app.get('/api/debrief-config', authenticate, async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .single();
+    if (data) return res.json({ sections: data.sections });
+    res.json({ sections: null }); // null = utiliser le défaut côté frontend
+  } catch { res.json({ sections: null }); }
+});
+
+app.put('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
+  const { sections } = req.body;
+  if (!sections || !Array.isArray(sections)) return res.status(400).json({ error: 'sections requises' });
+  try {
+    // Upsert — une seule config globale
+    const { data: existing } = await supabase.from('debrief_config').select('id').limit(1).single();
+    if (existing) {
+      await supabase.from('debrief_config').update({ sections, updated_at: new Date().toISOString(), updated_by: req.user.id }).eq('id', existing.id);
+    } else {
+      await supabase.from('debrief_config').insert({ sections, updated_by: req.user.id });
+    }
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
+  try {
+    await supabase.from('debrief_config').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'9' }));
-app.listen(PORT, () => console.log(`✅ CloserDebrief API v9 — port ${PORT}`));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'10' }));
+app.listen(PORT, () => console.log(`✅ CloserDebrief API v10 — port ${PORT}`));
