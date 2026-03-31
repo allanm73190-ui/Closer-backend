@@ -10,12 +10,13 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
-const SUPABASE_KEY   = process.env.SUPABASE_KEY   || '';
-const JWT_SECRET     = process.env.JWT_SECRET     || 'change-in-prod';
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const APP_URL        = process.env.APP_URL        || 'https://closerdebrief.vercel.app';
-const PORT           = process.env.PORT           || 3001;
+const SUPABASE_URL      = process.env.SUPABASE_URL      || '';
+const SUPABASE_KEY      = process.env.SUPABASE_KEY      || '';
+const JWT_SECRET        = process.env.JWT_SECRET        || 'change-in-prod';
+const RESEND_API_KEY    = process.env.RESEND_API_KEY    || '';
+const APP_URL           = process.env.APP_URL           || 'https://closerdebrief.vercel.app';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const PORT              = process.env.PORT              || 3001;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -719,6 +720,154 @@ app.get('/api/objections', authenticate, async (req, res) => {
     });
   } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
+// ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
+const AI_SYSTEM_PROMPT = `Tu es un expert senior en analyse d'appels de vente et en coaching commercial, avec 15 ans d'expérience en closing B2B et B2C.
+
+Tu analyses les debriefs post-appel remplis par des closers. Chaque debrief évalue 5 sections : Découverte, Reformulation, Projection, Présentation de l'offre, Closing & Objections. Chaque section a un score sur 5.
+
+Tu es "CloserDebrief AI" et tu combines trois expertises :
+1. ANALYSTE — patterns, forces et faiblesses
+2. COACH — recommandations actionnables et personnalisées
+3. STRATÈGE — tendances pour optimiser le processus de vente
+
+Produis une analyse structurée :
+## ANALYSE DU DEBRIEF — [prospect] — [date]
+### 1. SCORE DE PERFORMANCE GLOBAL : [X/100]
+### 2. POINTS FORTS
+### 3. AXES D'AMÉLIORATION PRIORITAIRES (avec scripts alternatifs)
+### 4. ANALYSE DES OBJECTIONS
+### 5. PATTERN DÉTECTÉ
+### 6. COACHING PERSONNALISÉ
+### 7. SCRIPT SUGGÉRÉ
+**ACTION PRIORITAIRE : [action claire et mesurable]**
+
+Contraintes : direct, factuel, pas de flatterie. Ne jamais inventer de données. Entre 400 et 800 mots. Français.`;
+
+app.post('/api/ai/analyze', authenticate, async (req, res) => {
+  try {
+    const { debrief_id } = req.body;
+    if (!debrief_id) return res.status(400).json({ error: 'debrief_id requis' });
+
+    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée' });
+
+    // Récupérer le debrief complet
+    const { data: debrief, error: debriefError } = await supabase
+      .from('debriefs')
+      .select('id, user_id, user_name, prospect_name, call_date, is_closed, percentage, sections, section_notes, notes')
+      .eq('id', debrief_id)
+      .single();
+    if (debriefError || !debrief) return res.status(404).json({ error: 'Debrief introuvable' });
+
+    // Contrôle d'accès : un closer ne peut analyser que ses propres debriefs
+    if (req.user.role === 'closer' && debrief.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // Récupérer les 5 derniers debriefs du même user (historique)
+    const { data: history } = await supabase
+      .from('debriefs')
+      .select('prospect_name, call_date, percentage, is_closed, sections')
+      .eq('user_id', debrief.user_id)
+      .neq('id', debrief_id)
+      .order('call_date', { ascending: false })
+      .limit(5);
+
+    // Calculer les scores par section
+    const sectionScores = computeSectionScores(debrief.sections);
+
+    const SECTION_LABELS = {
+      decouverte:          'Découverte',
+      reformulation:       'Reformulation',
+      projection:          'Projection',
+      presentation_offre:  "Présentation de l'offre",
+      closing:             'Closing & Objections',
+    };
+
+    const formatDate = (d) => {
+      if (!d) return 'date inconnue';
+      return new Date(d).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' });
+    };
+
+    // Détail des sections avec notes
+    const sectionDetails = Object.entries(sectionScores).map(([key, score]) => {
+      const notes = debrief.section_notes?.[key] || {};
+      const lines = [`**${SECTION_LABELS[key] || key}** : ${score}/5`];
+      if (notes.strengths)    lines.push(`  Points forts : ${notes.strengths}`);
+      if (notes.weaknesses)   lines.push(`  Points faibles : ${notes.weaknesses}`);
+      if (notes.improvements) lines.push(`  Pistes : ${notes.improvements}`);
+      return lines.join('\n');
+    }).join('\n\n');
+
+    // Historique des appels précédents
+    const historyLines = (history || []).map((h, i) => {
+      const hs = computeSectionScores(h.sections);
+      const avg = Object.values(hs).reduce((s, v) => s + v, 0) / Object.values(hs).length;
+      return `${i + 1}. ${h.prospect_name || 'Inconnu'} — ${formatDate(h.call_date)} — Score: ${Math.round(h.percentage || 0)}% — Sections moy: ${(avg * 20).toFixed(0)}/100 ${h.is_closed ? '✓ Closé' : '✗ Non closé'}`;
+    });
+    const historyContext = historyLines.length > 0
+      ? '\n\n### HISTORIQUE DES ' + historyLines.length + ' DERNIERS APPELS\n' + historyLines.join('\n')
+      : '';
+
+    // Détail du closing et objections
+    const closingData = debrief.sections?.closing || {};
+    const objections  = (closingData.objections || []).filter(o => o !== 'aucune');
+
+    const userPrompt = `### DEBRIEF À ANALYSER
+**Closer :** ${debrief.user_name || 'Inconnu'}
+**Prospect :** ${debrief.prospect_name || 'Inconnu'}
+**Date de l'appel :** ${formatDate(debrief.call_date)}
+**Résultat :** ${debrief.is_closed ? 'CLOSÉ ✓' : 'NON CLOSÉ ✗'}
+**Score global :** ${Math.round(debrief.percentage || 0)}%
+**Notes générales :** ${debrief.notes || 'Aucune note'}
+
+### SCORES PAR SECTION
+${sectionDetails}
+
+### OBJECTIONS RENCONTRÉES
+${objections.length > 0 ? objections.join(', ') : 'Aucune objection signalée'}
+
+### DÉTAIL DU CLOSING
+- Annonce prix : ${closingData.annonce_prix || 'non renseigné'}
+- Silence après prix : ${closingData.silence_prix || 'non renseigné'}
+- Douleur réancrée : ${closingData.douleur_reancree || 'non renseigné'}
+- Objection isolée : ${closingData.objection_isolee || 'non renseigné'}
+- Résultat closing : ${closingData.resultat_closing || 'non renseigné'}${historyContext}
+
+Analyse ce debrief en profondeur et fournis un coaching actionnable.`;
+
+    // Appel API Anthropic (fetch natif, sans SDK)
+    const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type':      'application/json',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 4000,
+        system:     AI_SYSTEM_PROMPT,
+        messages:   [{ role: 'user', content: userPrompt }],
+      }),
+    });
+
+    if (!anthropicRes.ok) {
+      const errBody = await anthropicRes.text();
+      console.error('Anthropic API error:', anthropicRes.status, errBody);
+      return res.status(502).json({ error: 'Erreur API IA', detail: errBody });
+    }
+
+    const anthropicData = await anthropicRes.json();
+    const analysis = anthropicData.content?.[0]?.text || '';
+    if (!analysis) return res.status(502).json({ error: 'Réponse IA vide' });
+
+    res.json({ analysis });
+  } catch (err) {
+    console.error('AI analyze error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'10' }));
 app.listen(PORT, () => console.log("CloserDebrief API v10 - port " + PORT));
