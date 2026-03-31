@@ -665,7 +665,148 @@ app.delete('/api/debrief-config', authenticate, requireHOS, async (req, res) => 
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+// ─── OBJECTION LIBRARY ───────────────────────────────────────────────────────
+// GET /api/objections — agrège les objections depuis tous les debriefs accessibles
+// Retourne les objections groupées par type avec taux de closing et meilleures réponses
 
+app.get('/api/objections', authenticate, async (req, res) => {
+  try {
+    // Récupérer les debriefs accessibles (même logique que GET /debriefs)
+    let ids = [req.user.id];
+    if (req.user.role === 'head_of_sales') {
+      const memberIds = await getHOSTeamMemberIds(req.user.id);
+      ids = [...new Set([req.user.id, ...memberIds])];
+    }
+    const { data: debriefs, error } = await supabase
+      .from('debriefs')
+      .select('id, user_id, user_name, prospect_name, call_date, is_closed, percentage, sections, section_notes, notes')
+      .in('user_id', ids)
+      .order('call_date', { ascending: false });
+
+    if (error) return res.status(500).json({ error: 'Erreur récupération' });
+
+    const OBJECTION_LABELS = {
+      budget:    'Budget',
+      reflechir: 'Besoin de réfléchir',
+      conjoint:  'Conjoint / Tiers',
+      methode:   'Méthode / Doute produit',
+    };
+
+    // Agréger les objections depuis chaque debrief
+    const objMap = {}; // { type: { count, closed, debriefs: [...] } }
+
+    for (const d of (debriefs || [])) {
+      const closing = d.sections?.closing || {};
+      const objections = closing.objections || [];
+
+      for (const type of objections) {
+        if (type === 'aucune') continue;
+        if (!objMap[type]) objMap[type] = { type, label: OBJECTION_LABELS[type] || type, count: 0, closed: 0, debriefs: [] };
+        objMap[type].count++;
+        if (d.is_closed) objMap[type].closed++;
+        objMap[type].debriefs.push({
+          id: d.id,
+          prospect_name: d.prospect_name,
+          call_date: d.call_date,
+          user_name: d.user_name,
+          is_closed: d.is_closed,
+          percentage: d.percentage,
+          // Contexte utile pour les réponses
+          douleur_reancree: closing.douleur_reancree,
+          objection_isolee: closing.objection_isolee,
+          resultat_closing: closing.resultat_closing,
+          notes: d.notes,
+          section_notes_closing: d.section_notes?.closing || {},
+        });
+      }
+    }
+
+    // Trier : plus fréquentes d'abord
+    const result = Object.values(objMap)
+      .map(o => ({
+        ...o,
+        closingRate: o.count > 0 ? Math.round((o.closed / o.count) * 100) : 0,
+        // Meilleures réponses = debriefs closés triés par score
+        bestResponses: o.debriefs
+          .filter(d => d.is_closed)
+          .sort((a, b) => (b.percentage || 0) - (a.percentage || 0))
+          .slice(0, 5),
+        // Pires cas = debriefs non closés
+        worstCases: o.debriefs
+          .filter(d => !d.is_closed)
+          .sort((a, b) => (a.percentage || 0) - (b.percentage || 0))
+          .slice(0, 3),
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    res.json({
+      total: (debriefs || []).length,
+      totalWithObjections: (debriefs || []).filter(d => {
+        const objs = d.sections?.closing?.objections || [];
+        return objs.length > 0 && !objs.includes('aucune');
+      }).length,
+      objections: result,
+    });
+  } catch (err) {
+    console.error('Objections error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+// ─── OBJECTION LIBRARY ───────────────────────────────────────────────────────
+app.get('/api/objections', authenticate, async (req, res) => {
+  try {
+    let ids = [req.user.id];
+    if (req.user.role === 'head_of_sales') {
+      const memberIds = await getHOSTeamMemberIds(req.user.id);
+      ids = [...new Set([req.user.id, ...memberIds])];
+    }
+    const { data: debriefs, error } = await supabase
+      .from('debriefs')
+      .select('id, user_id, user_name, prospect_name, call_date, is_closed, percentage, sections, section_notes, notes')
+      .in('user_id', ids)
+      .order('call_date', { ascending: false });
+    if (error) return res.status(500).json({ error: 'Erreur récupération' });
+    const OBJECTION_LABELS = {
+      budget: 'Budget', reflechir: 'Besoin de réfléchir',
+      conjoint: 'Conjoint / Tiers', methode: 'Méthode / Doute produit',
+    };
+    const objMap = {};
+    for (const d of (debriefs || [])) {
+      const closing = d.sections?.closing || {};
+      const objections = closing.objections || [];
+      for (const type of objections) {
+        if (type === 'aucune') continue;
+        if (!objMap[type]) objMap[type] = { type, label: OBJECTION_LABELS[type] || type, count: 0, closed: 0, debriefs: [] };
+        objMap[type].count++;
+        if (d.is_closed) objMap[type].closed++;
+        objMap[type].debriefs.push({
+          id: d.id, prospect_name: d.prospect_name, call_date: d.call_date,
+          user_name: d.user_name, is_closed: d.is_closed, percentage: d.percentage,
+          douleur_reancree: closing.douleur_reancree, objection_isolee: closing.objection_isolee,
+          resultat_closing: closing.resultat_closing, notes: d.notes,
+          section_notes_closing: d.section_notes?.closing || {},
+        });
+      }
+    }
+    const result = Object.values(objMap)
+      .map(o => ({
+        ...o,
+        closingRate: o.count > 0 ? Math.round((o.closed / o.count) * 100) : 0,
+        bestResponses: o.debriefs.filter(d => d.is_closed).sort((a, b) => (b.percentage || 0) - (a.percentage || 0)).slice(0, 5),
+        worstCases: o.debriefs.filter(d => !d.is_closed).sort((a, b) => (a.percentage || 0) - (b.percentage || 0)).slice(0, 3),
+      }))
+      .sort((a, b) => b.count - a.count);
+    res.json({
+      total: (debriefs || []).length,
+      totalWithObjections: (debriefs || []).filter(d => {
+        const objs = d.sections?.closing?.objections || [];
+        return objs.length > 0 && !objs.includes('aucune');
+      }).length,
+      objections: result,
+    });
+  } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
+});
+```
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'10' }));
 app.listen(PORT, () => console.log(`✅ CloserDebrief API v10 — port ${PORT}`));
