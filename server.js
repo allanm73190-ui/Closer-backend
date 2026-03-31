@@ -719,7 +719,6 @@ app.get('/api/objections', authenticate, async (req, res) => {
     });
   } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
-```
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'10' }));
 app.listen(PORT, () => console.log("CloserDebrief API v10 - port " + PORT));
