@@ -722,4 +722,4 @@ app.get('/api/objections', authenticate, async (req, res) => {
 ```
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'10' }));
-app.listen(PORT, () => console.log(`✅ CloserDebrief API v10 — port ${PORT}`));
+app.listen(PORT, () => console.log("CloserDebrief API v10 - port " + PORT));
