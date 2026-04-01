@@ -16,6 +16,11 @@ const JWT_SECRET        = process.env.JWT_SECRET        || 'change-in-prod';
 const RESEND_API_KEY    = process.env.RESEND_API_KEY    || '';
 const APP_URL           = process.env.APP_URL           || 'https://closerdebrief.vercel.app';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL   = process.env.ANTHROPIC_MODEL   || 'claude-sonnet-4-20250514';
+const ANTHROPIC_FALLBACK_MODELS = (process.env.ANTHROPIC_FALLBACK_MODELS || 'claude-3-7-sonnet-latest,claude-3-5-sonnet-latest')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const PORT              = process.env.PORT              || 3001;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -743,6 +748,118 @@ Produis une analyse structurée :
 
 Contraintes : direct, factuel, pas de flatterie. Ne jamais inventer de données. Entre 400 et 800 mots. Français.`;
 
+function getAnthropicModelCandidates() {
+  const seen = new Set();
+  const ordered = [ANTHROPIC_MODEL, ...ANTHROPIC_FALLBACK_MODELS];
+  return ordered.filter(model => {
+    if (!model || seen.has(model)) return false;
+    seen.add(model);
+    return true;
+  });
+}
+
+function getSectionNoteForKey(allNotes, sectionKey) {
+  if (!allNotes) return {};
+  if (allNotes[sectionKey]) return allNotes[sectionKey];
+  // Compat: certaines versions stockent "offre" au lieu de "presentation_offre"
+  if (sectionKey === 'presentation_offre') return allNotes.offre || {};
+  return {};
+}
+
+function readNoteValue(noteObj, keys) {
+  if (!noteObj) return '';
+  for (const key of keys) {
+    if (noteObj[key]) return noteObj[key];
+  }
+  return '';
+}
+
+function shouldTryNextModel(status, message) {
+  if (status === 404 || status === 429 || status >= 500) return true;
+  if (status === 400 && /model|unsupported|not found|unknown/i.test(message)) return true;
+  return false;
+}
+
+async function callAnthropicWithFallback(systemPrompt, userPrompt) {
+  const modelCandidates = getAnthropicModelCandidates();
+  let lastError = null;
+
+  for (let i = 0; i < modelCandidates.length; i++) {
+    const model = modelCandidates[i];
+    try {
+      const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4000,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+      });
+
+      if (anthropicRes.ok) {
+        const anthropicData = await anthropicRes.json();
+        const analysis = anthropicData.content?.[0]?.text || '';
+        if (!analysis) {
+          return { ok: false, status: 502, message: 'Réponse IA vide', modelTried: model };
+        }
+        return { ok: true, analysis, modelUsed: model };
+      }
+
+      const errBody = await anthropicRes.text();
+      let errMessage = errBody;
+      try {
+        const parsed = JSON.parse(errBody);
+        errMessage = parsed?.error?.message || parsed?.error || errBody;
+      } catch {}
+
+      lastError = {
+        ok: false,
+        status: anthropicRes.status,
+        message: String(errMessage || 'Erreur API IA'),
+        modelTried: model,
+      };
+
+      const hasNext = i < modelCandidates.length - 1;
+      if (hasNext && shouldTryNextModel(anthropicRes.status, lastError.message)) {
+        console.warn('Anthropic model failed, trying fallback:', {
+          status: anthropicRes.status,
+          model,
+          message: lastError.message,
+        });
+        continue;
+      }
+
+      return lastError;
+    } catch (err) {
+      lastError = {
+        ok: false,
+        status: 502,
+        message: err?.message || 'Erreur réseau Anthropic',
+        modelTried: model,
+      };
+      const hasNext = i < modelCandidates.length - 1;
+      if (hasNext) continue;
+      return lastError;
+    }
+  }
+
+  return lastError || { ok: false, status: 502, message: 'Aucun modèle IA disponible' };
+}
+
+app.get('/api/ai/health', authenticate, async (req, res) => {
+  res.json({
+    configured: !!ANTHROPIC_API_KEY,
+    modelCandidates: getAnthropicModelCandidates(),
+    runtimeHasFetch: typeof fetch === 'function',
+  });
+});
+
 app.post('/api/ai/analyze', authenticate, async (req, res) => {
   try {
     const { debrief_id } = req.body;
@@ -790,11 +907,14 @@ app.post('/api/ai/analyze', authenticate, async (req, res) => {
 
     // Détail des sections avec notes
     const sectionDetails = Object.entries(sectionScores).map(([key, score]) => {
-      const notes = debrief.section_notes?.[key] || {};
+      const notes = getSectionNoteForKey(debrief.section_notes, key);
       const lines = [`**${SECTION_LABELS[key] || key}** : ${score}/5`];
-      if (notes.strengths)    lines.push(`  Points forts : ${notes.strengths}`);
-      if (notes.weaknesses)   lines.push(`  Points faibles : ${notes.weaknesses}`);
-      if (notes.improvements) lines.push(`  Pistes : ${notes.improvements}`);
+      const strengthNote = readNoteValue(notes, ['strength', 'strengths']);
+      const weaknessNote = readNoteValue(notes, ['weakness', 'weaknesses']);
+      const improveNote  = readNoteValue(notes, ['improvement', 'improvements']);
+      if (strengthNote) lines.push(`  Points forts : ${strengthNote}`);
+      if (weaknessNote) lines.push(`  Points faibles : ${weaknessNote}`);
+      if (improveNote)  lines.push(`  Pistes : ${improveNote}`);
       return lines.join('\n');
     }).join('\n\n');
 
@@ -835,33 +955,17 @@ ${objections.length > 0 ? objections.join(', ') : 'Aucune objection signalée'}
 
 Analyse ce debrief en profondeur et fournis un coaching actionnable.`;
 
-    // Appel API Anthropic (fetch natif, sans SDK)
-    const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key':         ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type':      'application/json',
-      },
-      body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 4000,
-        system:     AI_SYSTEM_PROMPT,
-        messages:   [{ role: 'user', content: userPrompt }],
-      }),
-    });
-
-    if (!anthropicRes.ok) {
-      const errBody = await anthropicRes.text();
-      console.error('Anthropic API error:', anthropicRes.status, errBody);
-      return res.status(502).json({ error: 'Erreur API IA', detail: errBody });
+    const aiResult = await callAnthropicWithFallback(AI_SYSTEM_PROMPT, userPrompt);
+    if (!aiResult.ok) {
+      console.error('Anthropic API error:', aiResult);
+      return res.status(aiResult.status || 502).json({
+        error: 'Erreur API IA',
+        detail: aiResult.message,
+        model: aiResult.modelTried,
+      });
     }
 
-    const anthropicData = await anthropicRes.json();
-    const analysis = anthropicData.content?.[0]?.text || '';
-    if (!analysis) return res.status(502).json({ error: 'Réponse IA vide' });
-
-    res.json({ analysis });
+    res.json({ analysis: aiResult.analysis, model: aiResult.modelUsed });
   } catch (err) {
     console.error('AI analyze error:', err);
     res.status(500).json({ error: 'Erreur serveur' });
