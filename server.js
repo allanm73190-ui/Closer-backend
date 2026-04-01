@@ -284,6 +284,36 @@ const DEFAULT_DEBRIEF_SECTION_CONFIG = [
   { key: 'closing',           title: 'Closing & Objections',      questions: [] },
 ];
 const PIPELINE_CONFIG_MARKER = '__pipeline_config__';
+const DEBRIEF_TEMPLATE_CONFIG_MARKER = '__debrief_templates__';
+const DEFAULT_DEBRIEF_TEMPLATE_CATALOG = {
+  defaultTemplateKey: 'standard',
+  templates: [
+    {
+      key: 'standard',
+      label: 'Standard Closer',
+      description: 'Template généraliste pour la majorité des offres.',
+      aiFocus: 'Analyse équilibrée du cycle de vente standard.',
+    },
+    {
+      key: 'high_ticket',
+      label: 'High Ticket',
+      description: 'Offres premium avec enjeu valeur/prix et engagement élevé.',
+      aiFocus: "Accent sur la transition valeur/prix, le cadrage de l'investissement et la posture de closing.",
+    },
+    {
+      key: 'b2b_service',
+      label: 'Service B2B',
+      description: 'Vente de services aux entreprises avec parties prenantes.',
+      aiFocus: 'Accent sur qualification du décideur, ROI, risques et process de décision.',
+    },
+    {
+      key: 'formation_coaching',
+      label: 'Formation / Coaching',
+      description: "Programmes d'accompagnement, compétences et transformation.",
+      aiFocus: 'Accent sur motivation réelle, capacité de mise en action et preuves de transformation.',
+    },
+  ],
+};
 const DEFAULT_PIPELINE_CONFIG = {
   statuses: [
     { key:'prospect', label:'Prospects', icon:'👤', color:'#6b7280', bg:'#f1f5f9', closed:false, won:false },
@@ -359,6 +389,51 @@ function normalizePipelineConfig(config) {
   return {
     statuses: normalizePipelineStatuses(config?.statuses),
     importantFields: normalizePipelineImportantFields(config?.importantFields),
+  };
+}
+
+function isDebriefTemplateEnvelope(sections) {
+  return Array.isArray(sections)
+    && sections.length === 1
+    && sections[0]
+    && sections[0].key === DEBRIEF_TEMPLATE_CONFIG_MARKER
+    && typeof sections[0].data === 'object'
+    && sections[0].data !== null;
+}
+
+function normalizeDebriefTemplateCatalog(catalog) {
+  const sourceTemplates = Array.isArray(catalog?.templates)
+    ? catalog.templates
+    : DEFAULT_DEBRIEF_TEMPLATE_CATALOG.templates;
+  const seen = new Set();
+  const templates = [];
+  for (let i = 0; i < sourceTemplates.length; i++) {
+    const template = sourceTemplates[i] || {};
+    const keyBase = sanitizePipelineKey(template.key || template.label || `template_${i + 1}`, `template_${i + 1}`);
+    let key = keyBase;
+    let suffix = 2;
+    while (seen.has(key)) {
+      key = `${keyBase}_${suffix}`;
+      suffix += 1;
+    }
+    seen.add(key);
+    templates.push({
+      key,
+      label: String(template.label || key).trim() || key,
+      description: String(template.description || '').trim(),
+      aiFocus: String(template.aiFocus || '').trim(),
+    });
+  }
+  const normalizedTemplates = templates.length > 0
+    ? templates
+    : DEFAULT_DEBRIEF_TEMPLATE_CATALOG.templates;
+  const wantedDefaultKey = sanitizePipelineKey(catalog?.defaultTemplateKey || '', '');
+  const defaultTemplateKey = normalizedTemplates.some(template => template.key === wantedDefaultKey)
+    ? wantedDefaultKey
+    : normalizedTemplates[0].key;
+  return {
+    defaultTemplateKey,
+    templates: normalizedTemplates,
   };
 }
 
@@ -533,6 +608,31 @@ async function getActivePipelineConfig(scopeOwnerId) {
     return normalizePipelineConfig(raw);
   }
   return DEFAULT_PIPELINE_CONFIG;
+}
+
+async function getDebriefTemplateRecord(scopeOwnerId) {
+  if (!scopeOwnerId) return null;
+  try {
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('id,sections,updated_by,updated_at')
+      .eq('updated_by', scopeOwnerId)
+      .order('updated_at', { ascending: false })
+      .limit(20);
+    const records = data || [];
+    return records.find(record => isDebriefTemplateEnvelope(record?.sections)) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getActiveDebriefTemplateCatalog(scopeOwnerId) {
+  const record = await getDebriefTemplateRecord(scopeOwnerId);
+  const raw = record?.sections?.[0]?.data;
+  if (raw && typeof raw === 'object') {
+    return normalizeDebriefTemplateCatalog(raw);
+  }
+  return DEFAULT_DEBRIEF_TEMPLATE_CATALOG;
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -1311,6 +1411,57 @@ app.put('/api/pipeline-config', authenticate, requireHOS, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ─── DEBRIEF TEMPLATES ──────────────────────────────────────────────────────
+// GET    /api/debrief-templates  — catalogue actif (scope équipe)
+// PUT    /api/debrief-templates  — sauvegarde catalogue (HOS uniquement)
+// DELETE /api/debrief-templates  — reset catalogue (HOS uniquement)
+app.get('/api/debrief-templates', authenticate, async (req, res) => {
+  try {
+    const scopeOwnerId = await getDebriefConfigScopeOwnerId(req.user);
+    const catalog = await getActiveDebriefTemplateCatalog(scopeOwnerId);
+    res.json(catalog);
+  } catch (e) {
+    res.json(DEFAULT_DEBRIEF_TEMPLATE_CATALOG);
+  }
+});
+
+app.put('/api/debrief-templates', authenticate, requireHOS, async (req, res) => {
+  try {
+    const catalog = normalizeDebriefTemplateCatalog(req.body || {});
+    const envelope = [{ key: DEBRIEF_TEMPLATE_CONFIG_MARKER, data: catalog }];
+    const existing = await getDebriefTemplateRecord(req.user.id);
+    if (existing) {
+      await supabase
+        .from('debrief_config')
+        .update({ sections: envelope, updated_at: new Date().toISOString(), updated_by: req.user.id })
+        .eq('id', existing.id);
+    } else {
+      await supabase.from('debrief_config').insert({ sections: envelope, updated_by: req.user.id });
+    }
+    res.json(catalog);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/debrief-templates', authenticate, requireHOS, async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('id,sections')
+      .eq('updated_by', req.user.id);
+    const ids = (data || [])
+      .filter(record => isDebriefTemplateEnvelope(record.sections))
+      .map(record => record.id);
+    if (ids.length > 0) {
+      await supabase.from('debrief_config').delete().in('id', ids);
+    }
+    res.json(DEFAULT_DEBRIEF_TEMPLATE_CATALOG);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 // ─── OBJECTION LIBRARY ───────────────────────────────────────────────────────
 app.get('/api/objections', authenticate, async (req, res) => {
   try {
@@ -1584,6 +1735,16 @@ app.post('/api/ai/analyze', authenticate, aiLimiter, async (req, res) => {
       role: debrief.user_id === req.user.id ? req.user.role : 'closer',
     });
     const debriefConfigSections = await getActiveDebriefConfigSections(configScopeOwnerId);
+    const templateCatalog = await getActiveDebriefTemplateCatalog(configScopeOwnerId);
+    const debriefMeta = debrief.sections?.__meta || {};
+    const selectedTemplateKeyRaw = sanitizePipelineKey(
+      debriefMeta.offer_template_key || debriefMeta.offer_type || '',
+      ''
+    );
+    const selectedTemplate = templateCatalog.templates.find(template => template.key === selectedTemplateKeyRaw)
+      || templateCatalog.templates.find(template => template.key === templateCatalog.defaultTemplateKey)
+      || templateCatalog.templates[0]
+      || null;
 
     const SECTION_LABELS = {
       decouverte: 'Découverte',
@@ -1652,6 +1813,8 @@ app.post('/api/ai/analyze', authenticate, aiLimiter, async (req, res) => {
 **Date de l'appel :** ${formatDate(debrief.call_date)}
 **Résultat :** ${debrief.is_closed ? 'CLOSÉ ✓' : 'NON CLOSÉ ✗'}
 **Score global :** ${Math.round(debrief.percentage || 0)}%
+**Template d'offre :** ${selectedTemplate?.label || 'Non renseigné'}
+**Contexte template :** ${selectedTemplate?.aiFocus || "Aucun focus spécifique"}
 **Notes générales :** ${debrief.notes || 'Aucune note'}
 
 ### SCORES PAR SECTION
@@ -1687,5 +1850,5 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'18' }));
-app.listen(PORT, () => console.log("CloserDebrief API v18 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'19' }));
+app.listen(PORT, () => console.log("CloserDebrief API v19 - port " + PORT));
