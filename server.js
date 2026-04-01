@@ -283,6 +283,84 @@ const DEFAULT_DEBRIEF_SECTION_CONFIG = [
   { key: 'presentation_offre',title: "Présentation de l'offre",   questions: [] },
   { key: 'closing',           title: 'Closing & Objections',      questions: [] },
 ];
+const PIPELINE_CONFIG_MARKER = '__pipeline_config__';
+const DEFAULT_PIPELINE_CONFIG = {
+  statuses: [
+    { key:'prospect', label:'Prospects', icon:'👤', color:'#6b7280', bg:'#f1f5f9', closed:false, won:false },
+    { key:'premier_appel', label:'1er appel', icon:'📞', color:'#e87d6a', bg:'rgba(253,232,228,.6)', closed:false, won:false },
+    { key:'relance', label:'Relance', icon:'🔄', color:'#d97706', bg:'#fef3c7', closed:false, won:false },
+    { key:'negociation', label:'Négociation', icon:'🤝', color:'#3b82f6', bg:'#dbeafe', closed:false, won:false },
+    { key:'signe', label:'Signés', icon:'✅', color:'#059669', bg:'#d1fae5', closed:true, won:true },
+    { key:'perdu', label:'Perdus', icon:'❌', color:'#dc2626', bg:'#fee2e2', closed:true, won:false },
+  ],
+  importantFields: ['source', 'value', 'follow_up_date', 'debrief_id', 'notes'],
+};
+const PIPELINE_ALLOWED_FIELDS = new Set(['source', 'value', 'follow_up_date', 'debrief_id', 'notes']);
+
+function sanitizePipelineKey(value, fallback) {
+  const base = String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return base || fallback;
+}
+
+function isPipelineConfigEnvelope(sections) {
+  return Array.isArray(sections)
+    && sections.length === 1
+    && sections[0]
+    && sections[0].key === PIPELINE_CONFIG_MARKER
+    && typeof sections[0].data === 'object'
+    && sections[0].data !== null;
+}
+
+function isDebriefConfigSections(sections) {
+  return Array.isArray(sections)
+    && sections.length > 0
+    && !isPipelineConfigEnvelope(sections)
+    && sections.some(section => section && (section.key || section.title));
+}
+
+function normalizePipelineStatuses(statuses) {
+  const list = Array.isArray(statuses) ? statuses : DEFAULT_PIPELINE_CONFIG.statuses;
+  const seen = new Set();
+  const normalized = [];
+  for (let i = 0; i < list.length; i++) {
+    const status = list[i] || {};
+    const keyBase = sanitizePipelineKey(status.key || status.label || `status_${i + 1}`, `status_${i + 1}`);
+    let key = keyBase;
+    let suffix = 2;
+    while (seen.has(key)) {
+      key = `${keyBase}_${suffix}`;
+      suffix += 1;
+    }
+    seen.add(key);
+    normalized.push({
+      key,
+      label: String(status.label || key).trim() || key,
+      icon: String(status.icon || '•').trim() || '•',
+      color: String(status.color || '#6b7280'),
+      bg: String(status.bg || '#f1f5f9'),
+      closed: !!status.closed,
+      won: !!status.won,
+    });
+  }
+  return normalized.length > 0 ? normalized : DEFAULT_PIPELINE_CONFIG.statuses;
+}
+
+function normalizePipelineImportantFields(fields) {
+  const list = Array.isArray(fields) ? fields.filter(field => PIPELINE_ALLOWED_FIELDS.has(field)) : [];
+  return list.length > 0 ? list : DEFAULT_PIPELINE_CONFIG.importantFields;
+}
+
+function normalizePipelineConfig(config) {
+  return {
+    statuses: normalizePipelineStatuses(config?.statuses),
+    importantFields: normalizePipelineImportantFields(config?.importantFields),
+  };
+}
 
 function normalizeSectionKey(rawKey) {
   if (!rawKey) return rawKey;
@@ -334,9 +412,9 @@ async function getDebriefConfigRecord(scopeOwnerId) {
       .select('id,sections,updated_by,updated_at')
       .eq('updated_by', scopeOwnerId)
       .order('updated_at', { ascending: false })
-      .limit(1)
-      .single();
-    return data || null;
+      .limit(20);
+    const records = data || [];
+    return records.find(record => isDebriefConfigSections(record?.sections)) || null;
   } catch {
     return null;
   }
@@ -348,6 +426,31 @@ async function getActiveDebriefConfigSections(scopeOwnerId) {
     return data.sections;
   }
   return DEFAULT_DEBRIEF_SECTION_CONFIG;
+}
+
+async function getPipelineConfigRecord(scopeOwnerId) {
+  if (!scopeOwnerId) return null;
+  try {
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('id,sections,updated_by,updated_at')
+      .eq('updated_by', scopeOwnerId)
+      .order('updated_at', { ascending: false })
+      .limit(20);
+    const records = data || [];
+    return records.find(record => isPipelineConfigEnvelope(record?.sections)) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getActivePipelineConfig(scopeOwnerId) {
+  const record = await getPipelineConfigRecord(scopeOwnerId);
+  const raw = record?.sections?.[0]?.data;
+  if (raw && typeof raw === 'object') {
+    return normalizePipelineConfig(raw);
+  }
+  return DEFAULT_PIPELINE_CONFIG;
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -1124,13 +1227,7 @@ app.put('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
   const { sections } = req.body;
   if (!sections || !Array.isArray(sections)) return res.status(400).json({ error: 'sections requises' });
   try {
-    const { data: existing } = await supabase
-      .from('debrief_config')
-      .select('id')
-      .eq('updated_by', req.user.id)
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .single();
+    const existing = await getDebriefConfigRecord(req.user.id);
     if (existing) {
       await supabase
         .from('debrief_config')
@@ -1145,9 +1242,50 @@ app.put('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
 
 app.delete('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
   try {
-    await supabase.from('debrief_config').delete().eq('updated_by', req.user.id);
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('id,sections')
+      .eq('updated_by', req.user.id);
+    const ids = (data || [])
+      .filter(record => isDebriefConfigSections(record.sections))
+      .map(record => record.id);
+    if (ids.length > 0) {
+      await supabase.from('debrief_config').delete().in('id', ids);
+    }
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── PIPELINE CONFIG ─────────────────────────────────────────────────────────
+// GET  /api/pipeline-config  — retourne la config pipeline active (scope équipe)
+// PUT  /api/pipeline-config  — sauvegarde la config (HOS uniquement)
+app.get('/api/pipeline-config', authenticate, async (req, res) => {
+  try {
+    const scopeOwnerId = await getDebriefConfigScopeOwnerId(req.user);
+    const config = await getActivePipelineConfig(scopeOwnerId);
+    res.json(config);
+  } catch (e) {
+    res.json(DEFAULT_PIPELINE_CONFIG);
+  }
+});
+
+app.put('/api/pipeline-config', authenticate, requireHOS, async (req, res) => {
+  try {
+    const config = normalizePipelineConfig(req.body || {});
+    const envelope = [{ key: PIPELINE_CONFIG_MARKER, data: config }];
+    const existing = await getPipelineConfigRecord(req.user.id);
+    if (existing) {
+      await supabase
+        .from('debrief_config')
+        .update({ sections: envelope, updated_at: new Date().toISOString(), updated_by: req.user.id })
+        .eq('id', existing.id);
+    } else {
+      await supabase.from('debrief_config').insert({ sections: envelope, updated_by: req.user.id });
+    }
+    res.json(config);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 // ─── OBJECTION LIBRARY ───────────────────────────────────────────────────────
 app.get('/api/objections', authenticate, async (req, res) => {
@@ -1542,5 +1680,5 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'14' }));
-app.listen(PORT, () => console.log("CloserDebrief API v14 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'15' }));
+app.listen(PORT, () => console.log("CloserDebrief API v15 - port " + PORT));
