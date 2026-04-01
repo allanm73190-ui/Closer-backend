@@ -145,9 +145,9 @@ function computeSectionScores(sections) {
 
 function computeDebriefTotals(sections) {
   let pts = 0;
-  let max = 0;
+  let maxRaw = 0;
   const add = (val, pos, total) => {
-    max += total;
+    maxRaw += total;
     if (Array.isArray(pos)) {
       if (Array.isArray(val)) pts += val.filter(v => pos.includes(v)).length;
       else if (pos.includes(val)) pts++;
@@ -183,7 +183,9 @@ function computeDebriefTotals(sections) {
   add(c.objection_isolee, 'oui', 1);
   add(c.resultat_closing, ['close', 'retrograde', 'relance'], 1);
 
-  return { total: pts, max, percentage: max > 0 ? Math.round((pts / max) * 100) : 0 };
+  const percentage = maxRaw > 0 ? Math.round((pts / maxRaw) * 100) : 0;
+  const score20 = maxRaw > 0 ? Math.round(((pts / maxRaw) * 20) * 10) / 10 : 0;
+  return { total: score20, max: 20, percentage, raw_total: pts, raw_max: maxRaw };
 }
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
@@ -448,8 +450,18 @@ app.get('/api/debriefs/:id', authenticate, async (req, res) => {
 
 app.post('/api/debriefs', authenticate, async (req, res) => {
   try {
-    const scores = computeSectionScores(req.body.sections);
-    const { data: debrief, error } = await supabase.from('debriefs').insert({ ...req.body, user_id:req.user.id, user_name:req.user.name, scores }).select().single();
+    const totals = computeDebriefTotals(req.body.sections || {});
+    const scores = computeSectionScores(req.body.sections || {});
+    const payload = {
+      ...req.body,
+      user_id: req.user.id,
+      user_name: req.user.name,
+      total_score: totals.total,
+      max_score: totals.max,
+      percentage: totals.percentage,
+      scores,
+    };
+    const { data: debrief, error } = await supabase.from('debriefs').insert(payload).select().single();
     if (error) return res.status(500).json({ error:'Erreur création' });
     // Auto-créer un deal dans le pipeline si prospect_name fourni
     await supabase.from('deals').insert({ user_id:req.user.id, user_name:req.user.name, prospect_name:req.body.prospect_name, source:'debrief', status:req.body.is_closed?'signe':'premier_appel', debrief_id:debrief.id, value:0 });
@@ -1192,27 +1204,44 @@ app.get('/api/objections', authenticate, async (req, res) => {
   } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
-const AI_SYSTEM_PROMPT = `Tu es un expert senior en analyse d'appels de vente et en coaching commercial, avec 15 ans d'expérience en closing B2B et B2C.
+const AI_SYSTEM_PROMPT = `Tu es "CloserDebrief AI", coach de closing ultra pragmatique.
 
-Tu analyses les debriefs post-appel remplis par des closers. Chaque debrief évalue 5 sections : Découverte, Reformulation, Projection, Présentation de l'offre, Closing & Objections. Chaque section a un score sur 5.
+Objectif:
+- Produire une synthèse courte, utile et actionnable.
+- Mettre en avant uniquement les points qui impactent réellement le closing.
+- Ne jamais inventer d'information.
 
-Tu es "CloserDebrief AI" et tu combines trois expertises :
-1. ANALYSTE — patterns, forces et faiblesses
-2. COACH — recommandations actionnables et personnalisées
-3. STRATÈGE — tendances pour optimiser le processus de vente
+Format OBLIGATOIRE (markdown):
+## SYNTHÈSE DEBRIEF — [prospect] — [date]
+### Score
+- Global: [X%] ([Y/20])
+- Résultat: [Closé/Non closé]
 
-Produis une analyse structurée :
-## ANALYSE DU DEBRIEF — [prospect] — [date]
-### 1. SCORE DE PERFORMANCE GLOBAL : [X/100]
-### 2. POINTS FORTS
-### 3. AXES D'AMÉLIORATION PRIORITAIRES (avec scripts alternatifs)
-### 4. ANALYSE DES OBJECTIONS
-### 5. PATTERN DÉTECTÉ
-### 6. COACHING PERSONNALISÉ
-### 7. SCRIPT SUGGÉRÉ
-**ACTION PRIORITAIRE : [action claire et mesurable]**
+### Points critiques (max 3)
+- [point 1]
+- [point 2]
+- [point 3]
 
-Contraintes : direct, factuel, pas de flatterie. Ne jamais inventer de données. Entre 400 et 800 mots. Français.`;
+### Points forts (max 2)
+- [point fort 1]
+- [point fort 2]
+
+### Objections à traiter
+- [objection + limite observée]
+
+### Plan d'action immédiat (3 actions max)
+1. [action concrète]
+2. [action concrète]
+3. [action concrète]
+
+**ACTION PRIORITAIRE : [une action claire et mesurable à faire avant le prochain appel]**
+
+Contraintes strictes:
+- Français.
+- Ton direct, précis, sans flatterie.
+- 140 à 220 mots maximum.
+- Pas de paragraphes longs: privilégier les puces courtes.
+- Si une donnée manque, écrire [INFO MANQUANTE].`;
 
 function getAnthropicModelCandidates() {
   const seen = new Set();
@@ -1254,7 +1283,7 @@ async function callAnthropicWithFallback(systemPrompt, userPrompt) {
         },
         body: JSON.stringify({
           model,
-          max_tokens: 4000,
+          max_tokens: 1200,
           system: systemPrompt,
           messages: [{ role: 'user', content: userPrompt }],
         }),
@@ -1493,7 +1522,7 @@ ${objections.length > 0 ? objections.join(', ') : 'Aucune objection signalée'}
 - Objection isolée : ${closingData.objection_isolee || 'non renseigné'}
 - Résultat closing : ${closingData.resultat_closing || 'non renseigné'}${historyContext}
 
-Analyse ce debrief en profondeur et fournis un coaching actionnable.`;
+Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 
     const aiResult = await callAnthropicWithFallback(AI_SYSTEM_PROMPT, userPrompt);
     if (!aiResult.ok) {
@@ -1513,5 +1542,5 @@ Analyse ce debrief en profondeur et fournis un coaching actionnable.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'13' }));
-app.listen(PORT, () => console.log("CloserDebrief API v13 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'14' }));
+app.listen(PORT, () => console.log("CloserDebrief API v14 - port " + PORT));
