@@ -3,12 +3,11 @@ const express  = require('express');
 const cors     = require('cors');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
+const helmet   = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 const SUPABASE_URL      = process.env.SUPABASE_URL      || '';
 const SUPABASE_KEY      = process.env.SUPABASE_KEY      || '';
@@ -22,6 +21,57 @@ const ANTHROPIC_FALLBACK_MODELS = (process.env.ANTHROPIC_FALLBACK_MODELS || 'cla
   .map(s => s.trim())
   .filter(Boolean);
 const PORT              = process.env.PORT              || 3001;
+const IS_PROD           = process.env.NODE_ENV === 'production';
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://closer-frontend-mu.vercel.app',
+  'https://closerdebrief.vercel.app',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+];
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const AUTH_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_AUTH_MAX || 20);
+const AI_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_AI_MAX || 20);
+const BODY_LIMIT = process.env.BODY_LIMIT || '1mb';
+
+if (IS_PROD && (!JWT_SECRET || JWT_SECRET === 'change-in-prod' || JWT_SECRET.length < 32)) {
+  throw new Error('JWT_SECRET non sécurisé. Configurez une valeur unique (32+ caractères).');
+}
+if (IS_PROD && (!SUPABASE_URL || !SUPABASE_KEY)) {
+  throw new Error('SUPABASE_URL / SUPABASE_KEY manquants en production.');
+}
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: AUTH_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de tentatives. Réessayez dans quelques minutes.' },
+});
+
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: AI_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de requêtes IA. Réessayez dans 1 minute.' },
+});
+
+app.set('trust proxy', 1);
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true); // curl / health checks / apps natives
+    if (CORS_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-zapier-secret'],
+}));
+app.use(express.json({ limit: BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -178,6 +228,49 @@ async function getHOSTeamMemberIds(hosId) {
   return (members||[]).map(m => m.id);
 }
 
+async function canUserAccessOwnerData(user, ownerUserId) {
+  if (!user?.id || !ownerUserId) return false;
+  if (ownerUserId === user.id) return true;
+  if (user.role !== 'head_of_sales') return false;
+  const memberIds = await getHOSTeamMemberIds(user.id);
+  return memberIds.includes(ownerUserId);
+}
+
+async function assertCloserManagedByHOS(hosId, closerId) {
+  if (!hosId || !closerId) return false;
+  const { data: closer } = await supabase
+    .from('users')
+    .select('id,role,team_id')
+    .eq('id', closerId)
+    .single();
+  if (!closer || closer.role !== 'closer' || !closer.team_id) return false;
+  const { data: team } = await supabase
+    .from('teams')
+    .select('owner_id')
+    .eq('id', closer.team_id)
+    .single();
+  return !!team && team.owner_id === hosId;
+}
+
+async function getDebriefConfigScopeOwnerId(user) {
+  if (!user?.id) return null;
+  if (user.role === 'head_of_sales') return user.id;
+
+  const { data: me } = await supabase
+    .from('users')
+    .select('team_id')
+    .eq('id', user.id)
+    .single();
+  if (!me?.team_id) return user.id;
+
+  const { data: team } = await supabase
+    .from('teams')
+    .select('owner_id')
+    .eq('id', me.team_id)
+    .single();
+  return team?.owner_id || user.id;
+}
+
 const DEFAULT_DEBRIEF_SECTION_CONFIG = [
   { key: 'decouverte',        title: 'Phase de découverte',       questions: [] },
   { key: 'reformulation',     title: 'Reformulation',             questions: [] },
@@ -228,24 +321,32 @@ function formatAnswerFromQuestion(question, rawValue) {
   return labelByValue.get(String(rawValue)) || String(rawValue);
 }
 
-async function getActiveDebriefConfigSections() {
+async function getDebriefConfigRecord(scopeOwnerId) {
+  if (!scopeOwnerId) return null;
   try {
     const { data } = await supabase
       .from('debrief_config')
-      .select('sections')
+      .select('id,sections,updated_by,updated_at')
+      .eq('updated_by', scopeOwnerId)
       .order('updated_at', { ascending: false })
       .limit(1)
       .single();
+    return data || null;
+  } catch {
+    return null;
+  }
+}
 
-    if (Array.isArray(data?.sections) && data.sections.length > 0) {
-      return data.sections;
-    }
-  } catch {}
+async function getActiveDebriefConfigSections(scopeOwnerId) {
+  const data = await getDebriefConfigRecord(scopeOwnerId);
+  if (Array.isArray(data?.sections) && data.sections.length > 0) {
+    return data.sections;
+  }
   return DEFAULT_DEBRIEF_SECTION_CONFIG;
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, password, name, role, invite_code } = req.body;
     if (!email||!password||!name) return res.status(400).json({ error:'Tous les champs sont requis' });
@@ -269,7 +370,7 @@ app.post('/api/auth/register', async (req, res) => {
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email||!password) return res.status(400).json({ error:'Email et mot de passe requis' });
@@ -286,7 +387,7 @@ app.get('/api/auth/me', authenticate, async (req, res) => {
   res.json(user);
 });
 
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error:'Email requis' });
   const { data: user } = await supabase.from('users').select('id,name').eq('email', email).single();
@@ -298,7 +399,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   res.json({ success:true });
 });
 
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body;
   if (!token||!password) return res.status(400).json({ error:'Token et mot de passe requis' });
   if (password.length < 8) return res.status(400).json({ error:'Trop court' });
@@ -310,7 +411,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
   } catch { return res.status(400).json({ error:'Token invalide ou expiré' }); }
 });
 
-app.post('/api/auth/change-password', authenticate, async (req, res) => {
+app.post('/api/auth/change-password', authenticate, authLimiter, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword||!newPassword) return res.status(400).json({ error:'Champs requis' });
   if (newPassword.length < 8) return res.status(400).json({ error:'Trop court' });
@@ -337,7 +438,8 @@ app.get('/api/debriefs', authenticate, async (req, res) => {
 app.get('/api/debriefs/:id', authenticate, async (req, res) => {
   const { data: debrief } = await supabase.from('debriefs').select('*').eq('id', req.params.id).single();
   if (!debrief) return res.status(404).json({ error:'Debrief introuvable' });
-  if (req.user.role === 'closer' && debrief.user_id !== req.user.id) return res.status(403).json({ error:'Accès refusé' });
+  const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+  if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
   res.json(debrief);
 });
 
@@ -361,7 +463,8 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
       .single();
 
     if (existingError || !existing) return res.status(404).json({ error:'Debrief introuvable' });
-    if (req.user.role === 'closer' && existing.user_id !== req.user.id) {
+    const canAccess = await canUserAccessOwnerData(req.user, existing.user_id);
+    if (!canAccess) {
       return res.status(403).json({ error:'Accès refusé' });
     }
 
@@ -416,19 +519,36 @@ app.delete('/api/debriefs/:id', authenticate, async (req, res) => {
   try {
     const { data: debrief } = await supabase.from('debriefs').select('user_id').eq('id', req.params.id).single();
     if (!debrief) return res.status(404).json({ error:'Introuvable' });
-    if (req.user.role === 'closer' && debrief.user_id !== req.user.id) return res.status(403).json({ error:'Accès refusé' });
+    const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
     await supabase.from('debriefs').delete().eq('id', req.params.id);
-    res.json({ success:true, gamification:await buildGamification(req.user.id) });
+    res.json({ success:true, gamification:await buildGamification(debrief.user_id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
 // ─── COMMENTS ─────────────────────────────────────────────────────────────────
 app.get('/api/debriefs/:id/comments', authenticate, async (req, res) => {
+  const { data: debrief } = await supabase
+    .from('debriefs')
+    .select('id,user_id')
+    .eq('id', req.params.id)
+    .single();
+  if (!debrief) return res.status(404).json({ error:'Debrief introuvable' });
+  const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+  if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
   const { data } = await supabase.from('comments').select('*').eq('debrief_id', req.params.id).order('created_at', { ascending:true });
   res.json(data || []);
 });
 
 app.post('/api/debriefs/:id/comments', authenticate, async (req, res) => {
+  const { data: debrief } = await supabase
+    .from('debriefs')
+    .select('id,user_id')
+    .eq('id', req.params.id)
+    .single();
+  if (!debrief) return res.status(404).json({ error:'Debrief introuvable' });
+  const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+  if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
   const { content } = req.body;
   if (!content?.trim()) return res.status(400).json({ error:'Contenu requis' });
   const { data, error } = await supabase.from('comments').insert({ debrief_id:req.params.id, author_id:req.user.id, author_name:req.user.name, content:content.trim() }).select().single();
@@ -437,9 +557,24 @@ app.post('/api/debriefs/:id/comments', authenticate, async (req, res) => {
 });
 
 app.delete('/api/comments/:id', authenticate, async (req, res) => {
-  const { data: c } = await supabase.from('comments').select('author_id').eq('id', req.params.id).single();
+  const { data: c } = await supabase
+    .from('comments')
+    .select('author_id,debrief_id')
+    .eq('id', req.params.id)
+    .single();
   if (!c) return res.status(404).json({ error:'Introuvable' });
-  if (c.author_id !== req.user.id && req.user.role !== 'head_of_sales') return res.status(403).json({ error:'Accès refusé' });
+  const isAuthor = c.author_id === req.user.id;
+  if (!isAuthor) {
+    if (req.user.role !== 'head_of_sales') return res.status(403).json({ error:'Accès refusé' });
+    const { data: debrief } = await supabase
+      .from('debriefs')
+      .select('user_id')
+      .eq('id', c.debrief_id)
+      .single();
+    if (!debrief) return res.status(404).json({ error:'Debrief introuvable' });
+    const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
+  }
   await supabase.from('comments').delete().eq('id', req.params.id);
   res.json({ success:true });
 });
@@ -514,6 +649,8 @@ app.get('/api/objectives/me', authenticate, async (req, res) => {
 // GET objectifs d'un closer (HOS)
 app.get('/api/objectives/closer/:closerId', authenticate, requireHOS, async (req, res) => {
   try {
+    const allowed = await assertCloserManagedByHOS(req.user.id, req.params.closerId);
+    if (!allowed) return res.status(403).json({ error:'Accès refusé' });
     const { data } = await supabase.from('objectives').select('*').eq('closer_id', req.params.closerId).order('period_start', { ascending:false });
     res.json((data || []).map(mapObjectiveAliases));
   } catch(err) { res.status(500).json({ error:'Erreur serveur' }); }
@@ -534,6 +671,8 @@ app.post('/api/objectives', authenticate, requireHOS, async (req, res) => {
       target_revenue,
     } = req.body;
     if (!closer_id||!period_type||!period_start) return res.status(400).json({ error:'Champs requis' });
+    const allowed = await assertCloserManagedByHOS(req.user.id, closer_id);
+    if (!allowed) return res.status(403).json({ error:'Accès refusé' });
 
     const normalizedTargets = {
       target_debriefs: Number(target_reecoutes ?? target_debriefs ?? 0) || 0,
@@ -578,6 +717,8 @@ app.get('/api/action-plans/me', authenticate, async (req, res) => {
 });
 
 app.get('/api/action-plans/closer/:closerId', authenticate, requireHOS, async (req, res) => {
+  const allowed = await assertCloserManagedByHOS(req.user.id, req.params.closerId);
+  if (!allowed) return res.status(403).json({ error:'Accès refusé' });
   const { data } = await supabase.from('action_plans').select('*').eq('closer_id', req.params.closerId).order('created_at', { ascending:false });
   res.json(data || []);
 });
@@ -585,6 +726,8 @@ app.get('/api/action-plans/closer/:closerId', authenticate, requireHOS, async (r
 app.post('/api/action-plans', authenticate, requireHOS, async (req, res) => {
   const { closer_id, axis, description } = req.body;
   if (!closer_id||!axis) return res.status(400).json({ error:'Champs requis' });
+  const allowed = await assertCloserManagedByHOS(req.user.id, closer_id);
+  if (!allowed) return res.status(403).json({ error:'Accès refusé' });
   // Max 3 plans actifs par closer
   const { data: active } = await supabase.from('action_plans').select('id').eq('closer_id', closer_id).eq('status', 'active');
   if ((active||[]).length >= 3) return res.status(400).json({ error:'Maximum 3 axes actifs par closer' });
@@ -594,6 +737,23 @@ app.post('/api/action-plans', authenticate, requireHOS, async (req, res) => {
 });
 
 app.patch('/api/action-plans/:id', authenticate, async (req, res) => {
+  const { data: existing } = await supabase
+    .from('action_plans')
+    .select('id,closer_id,hos_id')
+    .eq('id', req.params.id)
+    .single();
+  if (!existing) return res.status(404).json({ error:'Plan introuvable' });
+
+  if (req.user.role === 'closer') {
+    if (existing.closer_id !== req.user.id) return res.status(403).json({ error:'Accès refusé' });
+  } else if (req.user.role === 'head_of_sales') {
+    const isOwner = existing.hos_id === req.user.id;
+    const managesCloser = await assertCloserManagedByHOS(req.user.id, existing.closer_id);
+    if (!isOwner && !managesCloser) return res.status(403).json({ error:'Accès refusé' });
+  } else {
+    return res.status(403).json({ error:'Accès refusé' });
+  }
+
   const { status, description } = req.body;
   const update = {};
   if (status) { update.status = status; if (status==='resolved') update.resolved_at = new Date().toISOString(); }
@@ -604,6 +764,15 @@ app.patch('/api/action-plans/:id', authenticate, async (req, res) => {
 });
 
 app.delete('/api/action-plans/:id', authenticate, requireHOS, async (req, res) => {
+  const { data: existing } = await supabase
+    .from('action_plans')
+    .select('id,closer_id,hos_id')
+    .eq('id', req.params.id)
+    .single();
+  if (!existing) return res.status(404).json({ error:'Plan introuvable' });
+  const isOwner = existing.hos_id === req.user.id;
+  const managesCloser = await assertCloserManagedByHOS(req.user.id, existing.closer_id);
+  if (!isOwner && !managesCloser) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('action_plans').delete().eq('id', req.params.id);
   res.json({ success:true });
 });
@@ -634,7 +803,8 @@ app.patch('/api/deals/:id', authenticate, async (req, res) => {
   try {
     const { data: deal } = await supabase.from('deals').select('user_id').eq('id', req.params.id).single();
     if (!deal) return res.status(404).json({ error:'Deal introuvable' });
-    if (req.user.role === 'closer' && deal.user_id !== req.user.id) return res.status(403).json({ error:'Accès refusé' });
+    const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
+    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
     const { data, error } = await supabase.from('deals').update({ ...req.body, updated_at:new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) return res.status(500).json({ error:'Erreur mise à jour' });
     res.json(data);
@@ -645,7 +815,8 @@ app.delete('/api/deals/:id', authenticate, async (req, res) => {
   try {
     const { data: deal } = await supabase.from('deals').select('user_id').eq('id', req.params.id).single();
     if (!deal) return res.status(404).json({ error:'Deal introuvable' });
-    if (req.user.role === 'closer' && deal.user_id !== req.user.id) return res.status(403).json({ error:'Accès refusé' });
+    const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
+    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
     await supabase.from('deals').delete().eq('id', req.params.id);
     res.json({ success:true });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
@@ -882,6 +1053,8 @@ app.post('/api/zapier/push-deal', authenticate, async (req, res) => {
 
     const { data: deal } = await supabase.from('deals').select('*').eq('id', deal_id).single();
     if (!deal) return res.status(404).json({ error: 'Deal introuvable' });
+    const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
+    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
 
     // Mapper statut CloserDebrief → iClosed
     const statusMap = {
@@ -925,13 +1098,9 @@ app.post('/api/zapier/push-deal', authenticate, async (req, res) => {
 
 app.get('/api/debrief-config', authenticate, async (req, res) => {
   try {
-    const { data } = await supabase
-      .from('debrief_config')
-      .select('*')
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .single();
-    if (data) return res.json({ sections: data.sections });
+    const scopeOwnerId = await getDebriefConfigScopeOwnerId(req.user);
+    const data = await getDebriefConfigRecord(scopeOwnerId);
+    if (Array.isArray(data?.sections) && data.sections.length > 0) return res.json({ sections: data.sections });
     res.json({ sections: null }); // null = utiliser le défaut côté frontend
   } catch { res.json({ sections: null }); }
 });
@@ -940,10 +1109,18 @@ app.put('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
   const { sections } = req.body;
   if (!sections || !Array.isArray(sections)) return res.status(400).json({ error: 'sections requises' });
   try {
-    // Upsert — une seule config globale
-    const { data: existing } = await supabase.from('debrief_config').select('id').limit(1).single();
+    const { data: existing } = await supabase
+      .from('debrief_config')
+      .select('id')
+      .eq('updated_by', req.user.id)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .single();
     if (existing) {
-      await supabase.from('debrief_config').update({ sections, updated_at: new Date().toISOString(), updated_by: req.user.id }).eq('id', existing.id);
+      await supabase
+        .from('debrief_config')
+        .update({ sections, updated_at: new Date().toISOString(), updated_by: req.user.id })
+        .eq('id', existing.id);
     } else {
       await supabase.from('debrief_config').insert({ sections, updated_by: req.user.id });
     }
@@ -953,7 +1130,7 @@ app.put('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
 
 app.delete('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
   try {
-    await supabase.from('debrief_config').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await supabase.from('debrief_config').delete().eq('updated_by', req.user.id);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1141,7 +1318,7 @@ Contraintes strictes :
 - aucune explication méta
 - français`;
 
-app.post('/api/ai/objection-variant', authenticate, async (req, res) => {
+app.post('/api/ai/objection-variant', authenticate, aiLimiter, async (req, res) => {
   try {
     if (!ANTHROPIC_API_KEY) {
       return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée' });
@@ -1194,7 +1371,7 @@ app.get('/api/ai/health', authenticate, async (req, res) => {
   });
 });
 
-app.post('/api/ai/analyze', authenticate, async (req, res) => {
+app.post('/api/ai/analyze', authenticate, aiLimiter, async (req, res) => {
   try {
     const { debrief_id } = req.body;
     if (!debrief_id) return res.status(400).json({ error: 'debrief_id requis' });
@@ -1209,8 +1386,8 @@ app.post('/api/ai/analyze', authenticate, async (req, res) => {
       .single();
     if (debriefError || !debrief) return res.status(404).json({ error: 'Debrief introuvable' });
 
-    // Contrôle d'accès : un closer ne peut analyser que ses propres debriefs
-    if (req.user.role === 'closer' && debrief.user_id !== req.user.id) {
+    const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+    if (!canAccess) {
       return res.status(403).json({ error: 'Accès refusé' });
     }
 
@@ -1225,7 +1402,11 @@ app.post('/api/ai/analyze', authenticate, async (req, res) => {
 
     // Calculer les scores par section
     const sectionScores = computeSectionScores(debrief.sections);
-    const debriefConfigSections = await getActiveDebriefConfigSections();
+    const configScopeOwnerId = await getDebriefConfigScopeOwnerId({
+      id: debrief.user_id,
+      role: debrief.user_id === req.user.id ? req.user.role : 'closer',
+    });
+    const debriefConfigSections = await getActiveDebriefConfigSections(configScopeOwnerId);
 
     const SECTION_LABELS = {
       decouverte: 'Découverte',
@@ -1329,5 +1510,5 @@ Analyse ce debrief en profondeur et fournis un coaching actionnable.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'12' }));
-app.listen(PORT, () => console.log("CloserDebrief API v12 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'13' }));
+app.listen(PORT, () => console.log("CloserDebrief API v13 - port " + PORT));
