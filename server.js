@@ -285,6 +285,12 @@ const DEFAULT_DEBRIEF_SECTION_CONFIG = [
 ];
 const PIPELINE_CONFIG_MARKER = '__pipeline_config__';
 const DEBRIEF_TEMPLATE_CONFIG_MARKER = '__debrief_templates__';
+const APP_SETTINGS_CONFIG_MARKER = '__app_settings__';
+const DEBRIEF_SECTION_KEYS = new Set(['decouverte', 'reformulation', 'projection', 'presentation_offre', 'closing']);
+const DEFAULT_APP_SETTINGS = {
+  theme: 'light',
+  autoAiAfterDebrief: true,
+};
 const DEFAULT_DEBRIEF_TEMPLATE_CATALOG = {
   defaultTemplateKey: 'standard',
   templates: [
@@ -350,7 +356,9 @@ function isDebriefConfigSections(sections) {
   return Array.isArray(sections)
     && sections.length > 0
     && !isPipelineConfigEnvelope(sections)
-    && sections.some(section => section && (section.key || section.title));
+    && !isDebriefTemplateEnvelope(sections)
+    && !isAppSettingsEnvelope(sections)
+    && sections.some(section => section && DEBRIEF_SECTION_KEYS.has(String(section.key || '')));
 }
 
 function normalizePipelineStatuses(statuses) {
@@ -401,6 +409,15 @@ function isDebriefTemplateEnvelope(sections) {
     && sections[0].data !== null;
 }
 
+function isAppSettingsEnvelope(sections) {
+  return Array.isArray(sections)
+    && sections.length === 1
+    && sections[0]
+    && sections[0].key === APP_SETTINGS_CONFIG_MARKER
+    && typeof sections[0].data === 'object'
+    && sections[0].data !== null;
+}
+
 function normalizeDebriefTemplateCatalog(catalog) {
   const sourceTemplates = Array.isArray(catalog?.templates)
     ? catalog.templates
@@ -434,6 +451,21 @@ function normalizeDebriefTemplateCatalog(catalog) {
   return {
     defaultTemplateKey,
     templates: normalizedTemplates,
+  };
+}
+
+function normalizeAppSettings(settings) {
+  const source = settings && typeof settings === 'object' ? settings : {};
+  const theme = source.theme === 'dark' ? 'dark' : 'light';
+  let autoAiAfterDebrief = DEFAULT_APP_SETTINGS.autoAiAfterDebrief;
+  if (typeof source.autoAiAfterDebrief === 'boolean') {
+    autoAiAfterDebrief = source.autoAiAfterDebrief;
+  } else if (typeof source.auto_ai_after_debrief === 'boolean') {
+    autoAiAfterDebrief = source.auto_ai_after_debrief;
+  }
+  return {
+    theme,
+    autoAiAfterDebrief,
   };
 }
 
@@ -778,6 +810,31 @@ async function getActiveDebriefTemplateCatalog(scopeOwnerId) {
     return normalizeDebriefTemplateCatalog(raw);
   }
   return DEFAULT_DEBRIEF_TEMPLATE_CATALOG;
+}
+
+async function getAppSettingsRecord(userId) {
+  if (!userId) return null;
+  try {
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('id,sections,updated_by,updated_at')
+      .eq('updated_by', userId)
+      .order('updated_at', { ascending: false })
+      .limit(20);
+    const records = data || [];
+    return records.find(record => isAppSettingsEnvelope(record?.sections)) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getActiveAppSettings(userId) {
+  const record = await getAppSettingsRecord(userId);
+  const raw = record?.sections?.[0]?.data;
+  if (raw && typeof raw === 'object') {
+    return normalizeAppSettings(raw);
+  }
+  return DEFAULT_APP_SETTINGS;
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -1603,6 +1660,59 @@ app.delete('/api/debrief-templates', authenticate, requireHOS, async (req, res) 
       await supabase.from('debrief_config').delete().in('id', ids);
     }
     res.json(DEFAULT_DEBRIEF_TEMPLATE_CATALOG);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── APP SETTINGS (UTILISATEUR) ────────────────────────────────────────────
+// GET    /api/app-settings  — préférences utilisateur
+// PUT    /api/app-settings  — sauvegarde préférences utilisateur
+// DELETE /api/app-settings  — reset préférences utilisateur
+app.get('/api/app-settings', authenticate, async (req, res) => {
+  try {
+    const settings = await getActiveAppSettings(req.user.id);
+    res.json(settings);
+  } catch (e) {
+    res.json(DEFAULT_APP_SETTINGS);
+  }
+});
+
+app.put('/api/app-settings', authenticate, async (req, res) => {
+  try {
+    const payload = req.body?.settings && typeof req.body.settings === 'object'
+      ? req.body.settings
+      : req.body;
+    const settings = normalizeAppSettings(payload || {});
+    const envelope = [{ key: APP_SETTINGS_CONFIG_MARKER, data: settings }];
+    const existing = await getAppSettingsRecord(req.user.id);
+    if (existing) {
+      await supabase
+        .from('debrief_config')
+        .update({ sections: envelope, updated_at: new Date().toISOString(), updated_by: req.user.id })
+        .eq('id', existing.id);
+    } else {
+      await supabase.from('debrief_config').insert({ sections: envelope, updated_by: req.user.id });
+    }
+    res.json(settings);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/app-settings', authenticate, async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('debrief_config')
+      .select('id,sections')
+      .eq('updated_by', req.user.id);
+    const ids = (data || [])
+      .filter(record => isAppSettingsEnvelope(record.sections))
+      .map(record => record.id);
+    if (ids.length > 0) {
+      await supabase.from('debrief_config').delete().in('id', ids);
+    }
+    res.json(DEFAULT_APP_SETTINGS);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
