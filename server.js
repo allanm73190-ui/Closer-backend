@@ -561,6 +561,151 @@ function formatAnswerFromQuestion(question, rawValue) {
   return labelByValue.get(String(rawValue)) || String(rawValue);
 }
 
+function cleanScriptText(value, max = 420) {
+  const cleaned = String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.slice(0, max);
+}
+
+function normalizeSnippetKey(value) {
+  return cleanScriptText(value, 500)
+    .toLowerCase()
+    .replace(/[^a-z0-9àâäçéèêëîïôöùûüÿñæœ'’\s-]/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractObjectionScript(source) {
+  const candidates = [
+    source?.section_notes?.closing?.improvement,
+    source?.section_notes?.closing?.strength,
+    source?.section_notes_closing?.improvement,
+    source?.section_notes_closing?.strength,
+    source?.notes,
+  ];
+  for (const candidate of candidates) {
+    const script = cleanScriptText(candidate, 420);
+    if (script.length >= 24) return script;
+  }
+  return '';
+}
+
+function toStartOfDay(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function getDaysSince(value) {
+  const date = toStartOfDay(value);
+  if (!date) return null;
+  const now = toStartOfDay(new Date());
+  const diff = now.getTime() - date.getTime();
+  return Math.floor(diff / (24 * 60 * 60 * 1000));
+}
+
+function computePatternInsights(debriefs) {
+  const list = Array.isArray(debriefs) ? debriefs : [];
+  const lost = list.filter(d => !d.is_closed);
+  const totalLost = lost.length;
+  if (totalLost === 0) return [];
+
+  const seed = {
+    transition_value_price: {
+      id: 'transition_value_price',
+      title: 'Transition valeur/prix fragile',
+      recommendation: "Avant d'annoncer le prix, reformule la valeur et pose une question de calibration.",
+      count: 0,
+      sampleProspects: [],
+    },
+    objection_isolation: {
+      id: 'objection_isolation',
+      title: "Objection non isolée",
+      recommendation: "Valide l'objection principale puis demande explicitement s'il y en a une autre.",
+      count: 0,
+      sampleProspects: [],
+    },
+    urgency_missing: {
+      id: 'urgency_missing',
+      title: 'Urgence insuffisante en découverte',
+      recommendation: 'Creuse la temporalité réelle et le coût concret de la non-décision.',
+      count: 0,
+      sampleProspects: [],
+    },
+    projection_missing: {
+      id: 'projection_missing',
+      title: 'Projection trop faible',
+      recommendation: "Ajoute une question de projection concrète vers l'après accompagnement.",
+      count: 0,
+      sampleProspects: [],
+    },
+    offer_alignment: {
+      id: 'offer_alignment',
+      title: 'Offre insuffisamment reliée aux douleurs',
+      recommendation: 'Rattache chaque élément de ton offre à une douleur exprimée par le prospect.',
+      count: 0,
+      sampleProspects: [],
+    },
+  };
+
+  for (const d of lost) {
+    const sections = d.sections || {};
+    const closing = sections.closing || {};
+    const decouverte = sections.decouverte || {};
+    const projection = sections.projection || {};
+    const offre = sections.offre || sections.presentation_offre || {};
+
+    if (closing.annonce_prix !== 'directe' || closing.silence_prix !== 'oui') {
+      seed.transition_value_price.count += 1;
+      if (seed.transition_value_price.sampleProspects.length < 3 && d.prospect_name) {
+        seed.transition_value_price.sampleProspects.push(d.prospect_name);
+      }
+    }
+
+    if (closing.objection_isolee !== 'oui') {
+      seed.objection_isolation.count += 1;
+      if (seed.objection_isolation.sampleProspects.length < 3 && d.prospect_name) {
+        seed.objection_isolation.sampleProspects.push(d.prospect_name);
+      }
+    }
+
+    if (!['oui', 'artificielle'].includes(decouverte.urgence)) {
+      seed.urgency_missing.count += 1;
+      if (seed.urgency_missing.sampleProspects.length < 3 && d.prospect_name) {
+        seed.urgency_missing.sampleProspects.push(d.prospect_name);
+      }
+    }
+
+    if (projection.projection_posee !== 'oui') {
+      seed.projection_missing.count += 1;
+      if (seed.projection_missing.sampleProspects.length < 3 && d.prospect_name) {
+        seed.projection_missing.sampleProspects.push(d.prospect_name);
+      }
+    }
+
+    if (!['oui', 'partiel'].includes(offre.colle_douleurs)) {
+      seed.offer_alignment.count += 1;
+      if (seed.offer_alignment.sampleProspects.length < 3 && d.prospect_name) {
+        seed.offer_alignment.sampleProspects.push(d.prospect_name);
+      }
+    }
+  }
+
+  return Object.values(seed)
+    .filter(pattern => pattern.count > 0)
+    .map(pattern => {
+      const rate = Math.round((pattern.count / totalLost) * 100);
+      return {
+        ...pattern,
+        rate,
+        message: `Pattern détecté sur ${pattern.count}/${totalLost} appels non closés (${rate}%).`,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+}
+
 async function getDebriefConfigRecord(scopeOwnerId) {
   if (!scopeOwnerId) return null;
   try {
@@ -1484,6 +1629,7 @@ app.get('/api/objections', authenticate, async (req, res) => {
     for (const d of (debriefs || [])) {
       const closing = d.sections?.closing || {};
       const objections = closing.objections || [];
+      const objectionScript = extractObjectionScript(d);
       for (const type of objections) {
         if (type === 'aucune') continue;
         if (!objMap[type]) objMap[type] = { type, label: OBJECTION_LABELS[type] || type, count: 0, closed: 0, debriefs: [] };
@@ -1495,16 +1641,69 @@ app.get('/api/objections', authenticate, async (req, res) => {
           douleur_reancree: closing.douleur_reancree, objection_isolee: closing.objection_isolee,
           resultat_closing: closing.resultat_closing, notes: d.notes,
           section_notes_closing: d.section_notes?.closing || {},
+          objection_script: objectionScript,
         });
       }
     }
     const result = Object.values(objMap)
-      .map(o => ({
-        ...o,
-        closingRate: o.count > 0 ? Math.round((o.closed / o.count) * 100) : 0,
-        bestResponses: o.debriefs.filter(d => d.is_closed).sort((a, b) => (b.percentage || 0) - (a.percentage || 0)).slice(0, 5),
-        worstCases: o.debriefs.filter(d => !d.is_closed).sort((a, b) => (a.percentage || 0) - (b.percentage || 0)).slice(0, 3),
-      }))
+      .map(o => {
+        const snippetMap = {};
+        for (const d of o.debriefs) {
+          const script = cleanScriptText(d.objection_script, 420);
+          if (!script) continue;
+          const key = normalizeSnippetKey(script);
+          if (!key) continue;
+          if (!snippetMap[key]) {
+            snippetMap[key] = {
+              text: script,
+              uses: 0,
+              closed: 0,
+              scores: [],
+              examples: [],
+            };
+          }
+          snippetMap[key].uses += 1;
+          if (d.is_closed) snippetMap[key].closed += 1;
+          snippetMap[key].scores.push(Number(d.percentage || 0));
+          if (snippetMap[key].examples.length < 2) {
+            snippetMap[key].examples.push({
+              prospect_name: d.prospect_name || 'Inconnu',
+              call_date: d.call_date,
+              is_closed: !!d.is_closed,
+            });
+          }
+        }
+        const validatedResponses = Object.values(snippetMap)
+          .map(snippet => {
+            const closeRate = snippet.uses > 0 ? Math.round((snippet.closed / snippet.uses) * 100) : 0;
+            const avgScore = snippet.scores.length > 0
+              ? Math.round(snippet.scores.reduce((sum, value) => sum + value, 0) / snippet.scores.length)
+              : 0;
+            return {
+              text: snippet.text,
+              uses: snippet.uses,
+              closeRate,
+              avgScore,
+              validated: snippet.uses >= 2 ? closeRate >= 50 : closeRate >= 80,
+              examples: snippet.examples,
+            };
+          })
+          .sort((a, b) => {
+            if (b.validated !== a.validated) return (b.validated ? 1 : 0) - (a.validated ? 1 : 0);
+            if (b.closeRate !== a.closeRate) return b.closeRate - a.closeRate;
+            if (b.uses !== a.uses) return b.uses - a.uses;
+            return b.avgScore - a.avgScore;
+          })
+          .slice(0, 6);
+
+        return {
+          ...o,
+          closingRate: o.count > 0 ? Math.round((o.closed / o.count) * 100) : 0,
+          bestResponses: o.debriefs.filter(d => d.is_closed).sort((a, b) => (b.percentage || 0) - (a.percentage || 0)).slice(0, 5),
+          worstCases: o.debriefs.filter(d => !d.is_closed).sort((a, b) => (a.percentage || 0) - (b.percentage || 0)).slice(0, 3),
+          validatedResponses,
+        };
+      })
       .sort((a, b) => b.count - a.count);
     res.json({
       total: (debriefs || []).length,
@@ -1515,6 +1714,76 @@ app.get('/api/objections', authenticate, async (req, res) => {
       objections: result,
     });
   } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+// ─── PATTERNS ────────────────────────────────────────────────────────────────
+app.get('/api/patterns', authenticate, async (req, res) => {
+  try {
+    let ids = [req.user.id];
+    let scope = 'personal';
+    const targetCloserId = String(req.query?.closer_id || '').trim();
+
+    if (req.user.role === 'head_of_sales') {
+      if (targetCloserId) {
+        const allowed = await assertCloserManagedByHOS(req.user.id, targetCloserId);
+        if (!allowed) return res.status(403).json({ error: 'Accès refusé' });
+        ids = [targetCloserId];
+        scope = 'closer';
+      } else {
+        const memberIds = await getHOSTeamMemberIds(req.user.id);
+        ids = [...new Set(memberIds)];
+        scope = 'team';
+      }
+    }
+
+    if (ids.length === 0) {
+      return res.json({ scope, totalDebriefs: 0, totalLost: 0, patterns: [], byCloser: [] });
+    }
+
+    const { data: debriefs, error } = await supabase
+      .from('debriefs')
+      .select('id,user_id,user_name,prospect_name,call_date,is_closed,percentage,sections')
+      .in('user_id', ids)
+      .order('call_date', { ascending: false })
+      .limit(1200);
+    if (error) return res.status(500).json({ error: 'Erreur récupération patterns' });
+
+    const list = debriefs || [];
+    const patterns = computePatternInsights(list);
+    const totalLost = list.filter(d => !d.is_closed).length;
+
+    let byCloser = [];
+    if (scope === 'team') {
+      const grouped = {};
+      for (const d of list) {
+        if (!grouped[d.user_id]) grouped[d.user_id] = [];
+        grouped[d.user_id].push(d);
+      }
+      byCloser = Object.entries(grouped)
+        .map(([closerId, closerDebriefs]) => {
+          const closerPatterns = computePatternInsights(closerDebriefs).slice(0, 2);
+          return {
+            closer_id: closerId,
+            closer_name: closerDebriefs[0]?.user_name || 'Closer',
+            totalDebriefs: closerDebriefs.length,
+            totalLost: closerDebriefs.filter(d => !d.is_closed).length,
+            topPatterns: closerPatterns,
+          };
+        })
+        .sort((a, b) => b.totalDebriefs - a.totalDebriefs);
+    }
+
+    return res.json({
+      scope,
+      totalDebriefs: list.length,
+      totalLost,
+      patterns,
+      byCloser,
+    });
+  } catch (err) {
+    console.error('Patterns error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
 // ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
 const AI_SYSTEM_PROMPT = `Tu es un expert senior en analyse d'appels de vente et en coaching commercial, avec 15 ans d'expérience en closing B2B et B2C.
@@ -1646,6 +1915,71 @@ Contraintes strictes :
 - aucune explication méta
 - français`;
 
+const AI_MANAGER_SUMMARY_SYSTEM_PROMPT = `Tu es le Copilot Manager d'un Head of Sales.
+Ta mission : produire un résumé hebdomadaire ultra actionnable pour piloter une équipe de closers.
+
+Contraintes:
+- Français
+- 180 à 260 mots
+- Ton direct, concret, orienté décision
+- Structure stricte:
+1) Résumé exécutif (3 lignes max)
+2) Ce qui progresse
+3) Risques prioritaires
+4) 3 recommandations opérationnelles (format "Action -> Impact attendu")
+- Pas de fluff, pas de théorie générale.
+- Ne pas inventer de chiffres: utiliser uniquement les métriques fournies.`;
+
+function isDateInRange(value, fromDate, toDate) {
+  const date = toStartOfDay(value);
+  if (!date) return false;
+  return date >= fromDate && date <= toDate;
+}
+
+function safeRound(value) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(value);
+}
+
+function safePct(part, total) {
+  if (!total) return 0;
+  return Math.round((part / total) * 100);
+}
+
+function buildDeltaLabel(current, previous, unit = '') {
+  const delta = Number(current || 0) - Number(previous || 0);
+  if (delta === 0) return `stable${unit ? ` (${current}${unit})` : ''}`;
+  const sign = delta > 0 ? '+' : '';
+  return `${sign}${delta}${unit}`;
+}
+
+function isClosedDealStatus(status) {
+  return /signe|won|close|perdu|lost|closed/i.test(String(status || ''));
+}
+
+function buildManagerRecommendations({ currentWeek, previousWeek, patterns, pipelineAlerts }) {
+  const recommendations = [];
+  if (patterns[0]) {
+    recommendations.push(`${patterns[0].title} -> ${patterns[0].recommendation}`);
+  }
+  if (pipelineAlerts.atRisk > 0) {
+    recommendations.push(`Lancer une cellule de relance des ${pipelineAlerts.atRisk} deals à risque sous 24h -> récupérer des opportunités chaudes.`);
+  }
+  if (pipelineAlerts.noDate > 0) {
+    recommendations.push(`Imposer une date de prochain pas sur les ${pipelineAlerts.noDate} deals sans date -> réduire la stagnation du pipeline.`);
+  }
+  if (currentWeek.closeRate < 40) {
+    recommendations.push('Coacher la transition valeur/prix en jeu de rôle quotidien -> améliorer le taux de closing global.');
+  }
+  if (currentWeek.avgScore < previousWeek.avgScore) {
+    recommendations.push("Revue ciblée des debriefs en baisse de score cette semaine -> corriger rapidement les dérives d'exécution.");
+  }
+  if (recommendations.length < 3) {
+    recommendations.push('Faire un point hebdo individuel de 15 min par closer -> sécuriser un plan d’action concret par personne.');
+  }
+  return recommendations.slice(0, 4);
+}
+
 app.post('/api/ai/objection-variant', authenticate, aiLimiter, async (req, res) => {
   try {
     if (!ANTHROPIC_API_KEY) {
@@ -1687,6 +2021,177 @@ Format attendu: uniquement le script final (sans titre, sans puces).
     });
   } catch (err) {
     console.error('AI objection variant error:', err);
+    return res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/ai/manager-summary', authenticate, requireHOS, aiLimiter, async (req, res) => {
+  try {
+    const memberIds = await getHOSTeamMemberIds(req.user.id);
+    if (!memberIds.length) {
+      return res.json({
+        period: null,
+        metrics: null,
+        highlights: ['Aucun closer associé à votre équipe pour le moment.'],
+        recommendations: ['Inviter des closers avec un code équipe pour démarrer le pilotage hebdomadaire.'],
+        patterns: [],
+        topClosers: [],
+        aiSummary: '',
+        model: null,
+      });
+    }
+
+    const [debriefRes, dealsRes, usersRes] = await Promise.all([
+      supabase
+        .from('debriefs')
+        .select('id,user_id,user_name,prospect_name,call_date,is_closed,percentage,sections')
+        .in('user_id', memberIds)
+        .order('call_date', { ascending: false })
+        .limit(1600),
+      supabase
+        .from('deals')
+        .select('id,user_id,status,follow_up_date,updated_at,created_at')
+        .in('user_id', memberIds)
+        .order('updated_at', { ascending: false })
+        .limit(1600),
+      supabase
+        .from('users')
+        .select('id,name')
+        .in('id', memberIds),
+    ]);
+
+    if (debriefRes.error || dealsRes.error) {
+      return res.status(500).json({ error: 'Erreur récupération données manager' });
+    }
+
+    const debriefs = debriefRes.data || [];
+    const deals = dealsRes.data || [];
+    const users = usersRes.data || [];
+
+    const today = toStartOfDay(new Date());
+    const currentFrom = new Date(today);
+    currentFrom.setDate(today.getDate() - 6);
+    const previousFrom = new Date(currentFrom);
+    previousFrom.setDate(currentFrom.getDate() - 7);
+    const previousTo = new Date(currentFrom);
+    previousTo.setDate(currentFrom.getDate() - 1);
+
+    const currentWeekDebriefs = debriefs.filter(d => isDateInRange(d.call_date, currentFrom, today));
+    const previousWeekDebriefs = debriefs.filter(d => isDateInRange(d.call_date, previousFrom, previousTo));
+
+    const summarizeWeek = (list) => {
+      const total = list.length;
+      const closed = list.filter(item => item.is_closed).length;
+      const avgScore = total > 0
+        ? safeRound(list.reduce((sum, item) => sum + Number(item.percentage || 0), 0) / total)
+        : 0;
+      return {
+        total,
+        closed,
+        closeRate: safePct(closed, total),
+        avgScore,
+      };
+    };
+
+    const currentWeek = summarizeWeek(currentWeekDebriefs);
+    const previousWeek = summarizeWeek(previousWeekDebriefs);
+    const patterns = computePatternInsights(currentWeekDebriefs).slice(0, 4);
+
+    const openDeals = deals.filter(deal => !isClosedDealStatus(deal.status));
+    const atRisk = openDeals.filter(deal => {
+      const follow = toStartOfDay(deal.follow_up_date);
+      return follow && follow < today;
+    }).length;
+    const noDate = openDeals.filter(deal => !deal.follow_up_date).length;
+    const blocked = openDeals.filter(deal => {
+      const days = getDaysSince(deal.updated_at || deal.created_at);
+      return days !== null && days >= 8;
+    }).length;
+    const pipelineAlerts = { atRisk, noDate, blocked };
+
+    const userNameById = new Map((users || []).map(user => [user.id, user.name]));
+    const byCloser = {};
+    for (const debrief of currentWeekDebriefs) {
+      if (!byCloser[debrief.user_id]) byCloser[debrief.user_id] = [];
+      byCloser[debrief.user_id].push(debrief);
+    }
+    const topClosers = Object.entries(byCloser)
+      .map(([closerId, list]) => {
+        const summary = summarizeWeek(list);
+        return {
+          closer_id: closerId,
+          closer_name: userNameById.get(closerId) || list[0]?.user_name || 'Closer',
+          debriefs: summary.total,
+          avgScore: summary.avgScore,
+          closeRate: summary.closeRate,
+        };
+      })
+      .sort((a, b) => {
+        if (b.debriefs !== a.debriefs) return b.debriefs - a.debriefs;
+        if (b.closeRate !== a.closeRate) return b.closeRate - a.closeRate;
+        return b.avgScore - a.avgScore;
+      })
+      .slice(0, 5);
+
+    const highlights = [
+      `${currentWeek.total} debriefs cette semaine (${buildDeltaLabel(currentWeek.total, previousWeek.total)} vs semaine précédente).`,
+      `Score moyen: ${currentWeek.avgScore}% (${buildDeltaLabel(currentWeek.avgScore, previousWeek.avgScore, ' pts')}).`,
+      `Taux de closing: ${currentWeek.closeRate}% (${buildDeltaLabel(currentWeek.closeRate, previousWeek.closeRate, ' pts')}).`,
+      `Pipeline prioritaire: ${atRisk} à risque, ${noDate} sans date, ${blocked} bloqués.`,
+    ];
+    const recommendations = buildManagerRecommendations({ currentWeek, previousWeek, patterns, pipelineAlerts });
+
+    let aiSummary = '';
+    let model = null;
+    if (ANTHROPIC_API_KEY) {
+      const aiPrompt = `Période analysée: du ${currentFrom.toISOString().slice(0, 10)} au ${today.toISOString().slice(0, 10)}
+Closers actifs: ${memberIds.length}
+Debriefs semaine: ${currentWeek.total}
+Debriefs semaine précédente: ${previousWeek.total}
+Score moyen semaine: ${currentWeek.avgScore}%
+Score moyen semaine précédente: ${previousWeek.avgScore}%
+Taux de closing semaine: ${currentWeek.closeRate}%
+Taux de closing semaine précédente: ${previousWeek.closeRate}%
+Pipeline: à risque=${atRisk}, sans date=${noDate}, bloqués=${blocked}
+
+Top closers semaine:
+${topClosers.map((closer, idx) => `${idx + 1}. ${closer.closer_name} — ${closer.debriefs} debriefs — ${closer.closeRate}% closing — score ${closer.avgScore}%`).join('\n') || 'Aucun'}
+
+Patterns majeurs:
+${patterns.map(pattern => `- ${pattern.title}: ${pattern.count} cas (${pattern.rate}%)`).join('\n') || '- Aucun pattern critique identifié'}
+
+Recommandations opérationnelles de base:
+${recommendations.map(rec => `- ${rec}`).join('\n')}`;
+
+      const aiResult = await callAnthropicWithFallback(AI_MANAGER_SUMMARY_SYSTEM_PROMPT, aiPrompt);
+      if (aiResult.ok) {
+        aiSummary = String(aiResult.analysis || '').trim();
+        model = aiResult.modelUsed || null;
+      }
+    }
+
+    return res.json({
+      period: {
+        current_from: currentFrom.toISOString().slice(0, 10),
+        current_to: today.toISOString().slice(0, 10),
+        previous_from: previousFrom.toISOString().slice(0, 10),
+        previous_to: previousTo.toISOString().slice(0, 10),
+      },
+      metrics: {
+        team_members: memberIds.length,
+        current_week: currentWeek,
+        previous_week: previousWeek,
+        pipeline_alerts: pipelineAlerts,
+      },
+      highlights,
+      recommendations,
+      patterns,
+      topClosers,
+      aiSummary,
+      model,
+    });
+  } catch (err) {
+    console.error('AI manager summary error:', err);
     return res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -1850,5 +2355,5 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'19' }));
-app.listen(PORT, () => console.log("CloserDebrief API v19 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'20' }));
+app.listen(PORT, () => console.log("CloserDebrief API v20 - port " + PORT));
