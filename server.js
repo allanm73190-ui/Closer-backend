@@ -36,11 +36,14 @@ const AUTH_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_AUTH_MAX || 20);
 const AI_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_AI_MAX || 20);
 const BODY_LIMIT = process.env.BODY_LIMIT || '1mb';
 
-if (IS_PROD && (!JWT_SECRET || JWT_SECRET === 'change-in-prod' || JWT_SECRET.length < 32)) {
-  throw new Error('JWT_SECRET non sécurisé. Configurez une valeur unique (32+ caractères).');
+if (IS_PROD && (!JWT_SECRET || JWT_SECRET === 'change-in-prod')) {
+  throw new Error('JWT_SECRET manquant ou non sécurisé. Configurez une valeur unique.');
 }
 if (IS_PROD && (!SUPABASE_URL || !SUPABASE_KEY)) {
   throw new Error('SUPABASE_URL / SUPABASE_KEY manquants en production.');
+}
+if (IS_PROD && JWT_SECRET.length < 32) {
+  console.warn('JWT_SECRET recommandé: 32+ caractères (longueur actuelle: %s).', JWT_SECRET.length);
 }
 
 const authLimiter = rateLimit({
