@@ -71,7 +71,7 @@ app.use(cors({
     return callback(null, false);
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-zapier-secret'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
@@ -293,9 +293,9 @@ const DEFAULT_PIPELINE_CONFIG = {
     { key:'signe', label:'Signés', icon:'✅', color:'#059669', bg:'#d1fae5', closed:true, won:true },
     { key:'perdu', label:'Perdus', icon:'❌', color:'#dc2626', bg:'#fee2e2', closed:true, won:false },
   ],
-  importantFields: ['source', 'value', 'follow_up_date', 'debrief_id', 'notes'],
+  importantFields: ['first_name', 'last_name', 'email', 'phone', 'source', 'deal_closed', 'value', 'contact_date', 'note'],
 };
-const PIPELINE_ALLOWED_FIELDS = new Set(['source', 'value', 'follow_up_date', 'debrief_id', 'notes']);
+const PIPELINE_ALLOWED_FIELDS = new Set(['first_name', 'last_name', 'email', 'phone', 'source', 'deal_closed', 'value', 'contact_date', 'note']);
 
 function sanitizePipelineKey(value, fallback) {
   const base = String(value || '')
@@ -1233,129 +1233,6 @@ app.delete('/api/teams/:id/members/:memberId', authenticate, requireHOS, async (
   res.json({ success:true });
 });
 
-
-// ─── ZAPIER WEBHOOKS ──────────────────────────────────────────────────────────
-
-// Zapier → CloserDebrief : recevoir un deal depuis iClosed
-app.post('/api/zapier/iclosed-deal', async (req, res) => {
-  try {
-    const secret = req.headers['x-zapier-secret'];
-    if (secret !== process.env.ZAPIER_SECRET) {
-      return res.status(401).json({ error: 'Non autorisé' });
-    }
-
-    const {
-      prospect_name,
-      source,
-      value,
-      status,
-      follow_up_date,
-      notes,
-      iclosed_id,
-      closer_email,
-    } = req.body;
-
-    if (!prospect_name) return res.status(400).json({ error: 'prospect_name requis' });
-
-    // Trouver le closer par email si fourni
-    let user_id = null, user_name = 'iClosed';
-    if (closer_email) {
-      const { data: user } = await supabase
-        .from('users').select('id,name').eq('email', closer_email).single();
-      if (user) { user_id = user.id; user_name = user.name; }
-    }
-
-    // Mapper statut iClosed → CloserDebrief
-    const statusMap = {
-      'new':         'prospect',
-      'contacted':   'premier_appel',
-      'follow_up':   'relance',
-      'negotiation': 'negociation',
-      'won':         'signe',
-      'lost':        'perdu',
-    };
-    const mappedStatus = statusMap[status?.toLowerCase()] || 'prospect';
-
-    // Upsert : créer ou mettre à jour selon iclosed_id
-    if (iclosed_id) {
-      const { data: existing } = await supabase
-        .from('deals').select('id').eq('iclosed_id', iclosed_id).single();
-
-      if (existing) {
-        const { data } = await supabase.from('deals')
-          .update({ prospect_name, source, value: Number(value)||0, status: mappedStatus, follow_up_date, notes, updated_at: new Date().toISOString() })
-          .eq('id', existing.id).select().single();
-        return res.json({ action: 'updated', deal: data });
-      }
-    }
-
-    const { data, error } = await supabase.from('deals').insert({
-      user_id, user_name, prospect_name, source,
-      value: Number(value) || 0,
-      status: mappedStatus,
-      follow_up_date,
-      notes,
-      iclosed_id: iclosed_id || null,
-    }).select().single();
-
-    if (error) {
-      console.error('Supabase insert error:', JSON.stringify(error));
-      return res.status(500).json({ error: 'Erreur création deal', detail: error.message, code: error.code });
-    }
-    res.status(201).json({ action: 'created', deal: data });
-
-  } catch(err) {
-    console.error('Zapier webhook error:', err);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-// CloserDebrief → Zapier : envoyer un deal vers iClosed
-app.post('/api/zapier/push-deal', authenticate, async (req, res) => {
-  try {
-    const { deal_id } = req.body;
-    if (!deal_id) return res.status(400).json({ error: 'deal_id requis' });
-
-    const { data: deal } = await supabase.from('deals').select('*').eq('id', deal_id).single();
-    if (!deal) return res.status(404).json({ error: 'Deal introuvable' });
-    const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
-    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
-
-    // Mapper statut CloserDebrief → iClosed
-    const statusMap = {
-      'prospect':      'new',
-      'premier_appel': 'contacted',
-      'relance':       'follow_up',
-      'negociation':   'negotiation',
-      'signe':         'won',
-      'perdu':         'lost',
-    };
-
-    const zapierUrl = process.env.ZAPIER_WEBHOOK_URL;
-    if (!zapierUrl) return res.status(500).json({ error: 'ZAPIER_WEBHOOK_URL non configuré' });
-
-    await fetch(zapierUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prospect_name: deal.prospect_name,
-        value:         deal.value,
-        status:        statusMap[deal.status] || 'new',
-        source:        deal.source,
-        notes:         deal.notes,
-        follow_up_date:deal.follow_up_date,
-        iclosed_id:    deal.iclosed_id,
-        closer_name:   deal.user_name,
-      }),
-    });
-
-    res.json({ success: true });
-  } catch(err) {
-    console.error('Push deal error:', err);
-    res.status(500).json({ error: 'Erreur envoi Zapier' });
-  }
-});
-
 // ─── DEBRIEF CONFIG ───────────────────────────────────────────────────────────
 // GET  /api/debrief-config         — retourne la config active (ou défaut)
 // PUT  /api/debrief-config         — sauvegarde (HOS seulement)
@@ -1492,8 +1369,8 @@ app.get('/api/objections', authenticate, async (req, res) => {
 const AI_SYSTEM_PROMPT = `Tu es "CloserDebrief AI", coach de closing pragmatique et orienté résultat.
 
 Objectif:
-- Donner une analyse synthétique mais suffisamment détaillée pour coacher concrètement.
-- Mettre en avant les vrais leviers de performance (closing, objections, qualité de découverte, posture).
+- Donner une analyse intermédiaire: claire, actionnable, sans excès de détail.
+- Faire ressortir uniquement les vrais leviers de performance.
 - Ne jamais inventer d'information.
 
 Format OBLIGATOIRE (markdown):
@@ -1502,30 +1379,29 @@ Format OBLIGATOIRE (markdown):
 ### 1. Score & lecture rapide
 - Score global: [X%] ([Y/20])
 - Résultat: [Closé/Non closé]
-- Lecture: [2-3 phrases max sur ce que dit vraiment le score]
+- Lecture: [2 phrases max]
 
-### 2. Points forts (max 3)
-- [point fort concret + impact]
+### 2. Points forts (max 2)
+- [point fort concret + impact business]
 
-### 3. Points à corriger en priorité (max 3)
-- [point critique + conséquence]
+### 3. Priorités de correction (max 2)
+- [point critique + conséquence immédiate]
 
-### 4. Objections & traitement
-- [objection principale]
-- [ce qui a été bien fait ou raté]
-- [meilleure réponse alternative en 1-2 phrases, utilisable à l'oral]
+### 4. Objection clé & réponse alternative
+- Objection principale: [...]
+- Diagnostic: [ce qui manque / ce qui a bien été fait]
+- Réponse alternative (oral): [2 phrases max, prêtes à dire]
 
-### 5. Plan d'action du prochain appel
+### 5. Plan d'action prochain appel
 1. [action claire]
 2. [action claire]
-3. [action claire]
 
 **ACTION PRIORITAIRE : [une action unique, mesurable, à appliquer avant le prochain appel]**
 
 Contraintes:
 - Français.
 - Ton direct, concret, sans flatterie.
-- 230 à 360 mots.
+- 180 à 280 mots.
 - Phrases courtes, listes utiles, pas de blabla.
 - Si donnée absente: [INFO MANQUANTE].`;
 
@@ -1828,5 +1704,5 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'16' }));
-app.listen(PORT, () => console.log("CloserDebrief API v16 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'17' }));
+app.listen(PORT, () => console.log("CloserDebrief API v17 - port " + PORT));
