@@ -362,6 +362,88 @@ function normalizePipelineConfig(config) {
   };
 }
 
+const CONTACT_META_PREFIX = '[CD_CONTACT_META]';
+
+function sanitizeContactText(value, max = 180) {
+  return String(value || '').trim().slice(0, max);
+}
+
+function sanitizeContactDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
+}
+
+function parseDealNotes(rawNotes) {
+  const raw = typeof rawNotes === 'string' ? rawNotes : '';
+  if (!raw.startsWith(CONTACT_META_PREFIX)) {
+    return { meta: null, note: raw };
+  }
+  const payload = raw.slice(CONTACT_META_PREFIX.length);
+  const firstLineBreak = payload.indexOf('\n');
+  const jsonPart = firstLineBreak === -1 ? payload : payload.slice(0, firstLineBreak);
+  const notePart = firstLineBreak === -1 ? '' : payload.slice(firstLineBreak + 1).replace(/^\n/, '');
+  try {
+    const meta = JSON.parse(jsonPart);
+    return { meta: meta && typeof meta === 'object' ? meta : null, note: notePart };
+  } catch {
+    return { meta: null, note: raw };
+  }
+}
+
+function normalizeContactMeta(input, fallbackStatus) {
+  const source = input || {};
+  const first_name = sanitizeContactText(source.first_name, 120);
+  const last_name = sanitizeContactText(source.last_name, 120);
+  const email = sanitizeContactText(source.email, 180).toLowerCase();
+  const phone = sanitizeContactText(source.phone, 60);
+  const contact_date = sanitizeContactDate(source.contact_date);
+  let deal_closed = null;
+  if (typeof source.deal_closed === 'boolean') {
+    deal_closed = source.deal_closed;
+  } else if (typeof source.deal_closed === 'string') {
+    const boolMap = { 'true': true, 'false': false, '1': true, '0': false, 'oui': true, 'non': false };
+    if (Object.prototype.hasOwnProperty.call(boolMap, source.deal_closed.toLowerCase())) {
+      deal_closed = boolMap[source.deal_closed.toLowerCase()];
+    }
+  } else if (typeof fallbackStatus === 'string') {
+    deal_closed = /signe|won|close/i.test(fallbackStatus);
+  }
+  return { first_name, last_name, email, phone, contact_date, deal_closed };
+}
+
+function buildDealNotes(meta, note) {
+  const cleanNote = typeof note === 'string' ? note.trim() : '';
+  const hasMeta = meta && Object.values(meta).some(value => value !== null && value !== '');
+  if (!hasMeta) return cleanNote;
+  return `${CONTACT_META_PREFIX}${JSON.stringify(meta)}\n${cleanNote}`;
+}
+
+function inferProspectName(payload, fallback) {
+  const direct = sanitizeContactText(payload?.prospect_name || '', 220);
+  if (direct) return direct;
+  const full = `${sanitizeContactText(payload?.first_name || '', 120)} ${sanitizeContactText(payload?.last_name || '', 120)}`.trim();
+  if (full) return full;
+  return sanitizeContactText(fallback || '', 220);
+}
+
+function mapDealForClient(deal) {
+  const parsed = parseDealNotes(deal?.notes);
+  const meta = normalizeContactMeta(parsed.meta || {}, deal?.status);
+  const note = typeof parsed.note === 'string' ? parsed.note : '';
+  return {
+    ...deal,
+    notes: note,
+    note,
+    first_name: meta.first_name || '',
+    last_name: meta.last_name || '',
+    email: meta.email || '',
+    phone: meta.phone || '',
+    contact_date: meta.contact_date || deal?.follow_up_date || null,
+    deal_closed: typeof meta.deal_closed === 'boolean' ? meta.deal_closed : /signe|won|close/i.test(String(deal?.status || '')),
+  };
+}
+
 function normalizeSectionKey(rawKey) {
   if (!rawKey) return rawKey;
   return rawKey === 'presentation_offre' ? 'offre' : rawKey;
@@ -905,27 +987,92 @@ app.get('/api/deals', authenticate, async (req, res) => {
     }
     const { data, error } = await supabase.from('deals').select('*').in('user_id', ids).order('updated_at', { ascending:false });
     if (error) return res.status(500).json({ error:'Erreur récupération' });
-    res.json(data);
+    res.json((data || []).map(mapDealForClient));
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
 app.post('/api/deals', authenticate, async (req, res) => {
-  const { prospect_name, source, value, status, follow_up_date, notes } = req.body;
+  const payload = req.body || {};
+  const prospect_name = inferProspectName(payload);
   if (!prospect_name) return res.status(400).json({ error:'Nom du prospect requis' });
-  const { data, error } = await supabase.from('deals').insert({ user_id:req.user.id, user_name:req.user.name, prospect_name, source, value:value||0, status:status||'prospect', follow_up_date, notes }).select().single();
+
+  const contactMeta = normalizeContactMeta(payload, payload.status);
+  const status = typeof payload.status === 'string' && payload.status.trim()
+    ? payload.status.trim()
+    : (contactMeta.deal_closed ? 'signe' : 'prospect');
+  const note = payload.note ?? payload.notes ?? '';
+  const source = sanitizeContactText(payload.source, 120);
+  const value = Number(payload.value || 0) || 0;
+  const follow_up_date = sanitizeContactDate(payload.contact_date || payload.follow_up_date) || null;
+  const notes = buildDealNotes(contactMeta, note);
+
+  const { data, error } = await supabase
+    .from('deals')
+    .insert({
+      user_id: req.user.id,
+      user_name: req.user.name,
+      prospect_name,
+      source,
+      value,
+      status: status || 'prospect',
+      follow_up_date,
+      notes,
+      debrief_id: payload.debrief_id || null,
+    })
+    .select()
+    .single();
   if (error) return res.status(500).json({ error:'Erreur création' });
-  res.status(201).json(data);
+  res.status(201).json(mapDealForClient(data));
 });
 
 app.patch('/api/deals/:id', authenticate, async (req, res) => {
   try {
-    const { data: deal } = await supabase.from('deals').select('user_id').eq('id', req.params.id).single();
+    const { data: deal } = await supabase.from('deals').select('*').eq('id', req.params.id).single();
     if (!deal) return res.status(404).json({ error:'Deal introuvable' });
     const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
     if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
-    const { data, error } = await supabase.from('deals').update({ ...req.body, updated_at:new Date().toISOString() }).eq('id', req.params.id).select().single();
+
+    const payload = req.body || {};
+    const previous = parseDealNotes(deal.notes);
+    const previousMeta = previous.meta || {};
+    const nextMeta = normalizeContactMeta({
+      first_name: payload.first_name ?? previousMeta.first_name,
+      last_name: payload.last_name ?? previousMeta.last_name,
+      email: payload.email ?? previousMeta.email,
+      phone: payload.phone ?? previousMeta.phone,
+      contact_date: payload.contact_date ?? payload.follow_up_date ?? previousMeta.contact_date ?? deal.follow_up_date,
+      deal_closed: payload.deal_closed ?? previousMeta.deal_closed,
+    }, payload.status || deal.status);
+
+    const prospect_name = inferProspectName(payload, `${nextMeta.first_name || ''} ${nextMeta.last_name || ''}`.trim() || deal.prospect_name);
+    const explicitStatus = typeof payload.status === 'string' && payload.status.trim() ? payload.status.trim() : '';
+    const status = explicitStatus || (typeof nextMeta.deal_closed === 'boolean'
+      ? (nextMeta.deal_closed ? 'signe' : (deal.status === 'signe' ? 'prospect' : deal.status || 'prospect'))
+      : deal.status || 'prospect');
+    const note = payload.note ?? payload.notes ?? previous.note ?? '';
+    const follow_up_date = sanitizeContactDate(payload.contact_date || payload.follow_up_date || nextMeta.contact_date || deal.follow_up_date) || null;
+
+    const updateData = {
+      prospect_name,
+      source: payload.source !== undefined ? sanitizeContactText(payload.source, 120) : deal.source,
+      value: payload.value !== undefined ? Number(payload.value || 0) || 0 : (Number(deal.value || 0) || 0),
+      status,
+      follow_up_date,
+      notes: buildDealNotes(nextMeta, note),
+      updated_at: new Date().toISOString(),
+    };
+    if (payload.debrief_id !== undefined) {
+      updateData.debrief_id = payload.debrief_id || null;
+    }
+
+    const { data, error } = await supabase
+      .from('deals')
+      .update(updateData)
+      .eq('id', req.params.id)
+      .select()
+      .single();
     if (error) return res.status(500).json({ error:'Erreur mise à jour' });
-    res.json(data);
+    res.json(mapDealForClient(data));
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
@@ -1342,44 +1489,45 @@ app.get('/api/objections', authenticate, async (req, res) => {
   } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
-const AI_SYSTEM_PROMPT = `Tu es "CloserDebrief AI", coach de closing ultra pragmatique.
+const AI_SYSTEM_PROMPT = `Tu es "CloserDebrief AI", coach de closing pragmatique et orienté résultat.
 
 Objectif:
-- Produire une synthèse courte, utile et actionnable.
-- Mettre en avant uniquement les points qui impactent réellement le closing.
+- Donner une analyse synthétique mais suffisamment détaillée pour coacher concrètement.
+- Mettre en avant les vrais leviers de performance (closing, objections, qualité de découverte, posture).
 - Ne jamais inventer d'information.
 
 Format OBLIGATOIRE (markdown):
-## SYNTHÈSE DEBRIEF — [prospect] — [date]
-### Score
-- Global: [X%] ([Y/20])
+## ANALYSE DEBRIEF — [prospect] — [date]
+
+### 1. Score & lecture rapide
+- Score global: [X%] ([Y/20])
 - Résultat: [Closé/Non closé]
+- Lecture: [2-3 phrases max sur ce que dit vraiment le score]
 
-### Points critiques (max 3)
-- [point 1]
-- [point 2]
-- [point 3]
+### 2. Points forts (max 3)
+- [point fort concret + impact]
 
-### Points forts (max 2)
-- [point fort 1]
-- [point fort 2]
+### 3. Points à corriger en priorité (max 3)
+- [point critique + conséquence]
 
-### Objections à traiter
-- [objection + limite observée]
+### 4. Objections & traitement
+- [objection principale]
+- [ce qui a été bien fait ou raté]
+- [meilleure réponse alternative en 1-2 phrases, utilisable à l'oral]
 
-### Plan d'action immédiat (3 actions max)
-1. [action concrète]
-2. [action concrète]
-3. [action concrète]
+### 5. Plan d'action du prochain appel
+1. [action claire]
+2. [action claire]
+3. [action claire]
 
-**ACTION PRIORITAIRE : [une action claire et mesurable à faire avant le prochain appel]**
+**ACTION PRIORITAIRE : [une action unique, mesurable, à appliquer avant le prochain appel]**
 
-Contraintes strictes:
+Contraintes:
 - Français.
-- Ton direct, précis, sans flatterie.
-- 140 à 220 mots maximum.
-- Pas de paragraphes longs: privilégier les puces courtes.
-- Si une donnée manque, écrire [INFO MANQUANTE].`;
+- Ton direct, concret, sans flatterie.
+- 230 à 360 mots.
+- Phrases courtes, listes utiles, pas de blabla.
+- Si donnée absente: [INFO MANQUANTE].`;
 
 function getAnthropicModelCandidates() {
   const seen = new Set();
@@ -1680,5 +1828,5 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'15' }));
-app.listen(PORT, () => console.log("CloserDebrief API v15 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'16' }));
+app.listen(PORT, () => console.log("CloserDebrief API v16 - port " + PORT));
