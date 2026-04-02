@@ -1867,13 +1867,98 @@ app.patch('/api/deals/:id', authenticate, async (req, res) => {
 
 app.delete('/api/deals/:id', authenticate, async (req, res) => {
   try {
-    const { data: deal } = await supabase.from('deals').select('user_id').eq('id', req.params.id).single();
+    const { data: deal } = await supabase.from('deals').select('id,user_id,user_name').eq('id', req.params.id).single();
     if (!deal) return res.status(404).json({ error:'Deal introuvable' });
     const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
     if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
-    await supabase.from('deals').delete().eq('id', req.params.id);
-    res.json({ success:true });
+    const { data: deletedRows, error: deleteError } = await supabase
+      .from('deals')
+      .delete()
+      .eq('id', req.params.id)
+      .select('id');
+    if (deleteError) {
+      const detail = deleteError?.message || 'Suppression impossible';
+      return res.status(500).json({ error:'Erreur suppression', detail });
+    }
+    if (!Array.isArray(deletedRows) || deletedRows.length === 0) {
+      return res.status(500).json({ error:'Erreur suppression', detail:'Aucune ligne supprimée' });
+    }
+    res.json({ success:true, deleted: deletedRows.length });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
+});
+
+app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const rawUserId = String(req.body?.user_id || '').trim();
+    const rawUserName = String(req.body?.user_name || '').trim();
+    const rawLegacySource = String(req.body?.legacy_source || '').trim();
+    const rawProfileKey = String(req.body?.profile_key || '').trim().toLowerCase();
+    const hasLegacyRequest = rawLegacySource.toLowerCase() === 'iclosed';
+
+    const rowsByOwner = [];
+    if (rawUserId) {
+      const { data, error } = await supabase
+        .from('deals')
+        .select('id,user_id,user_name,source')
+        .eq('user_id', rawUserId);
+      if (error) return res.status(500).json({ error:'Erreur récupération', detail:error.message || '' });
+      rowsByOwner.push(...(data || []));
+    }
+
+    const rowsByName = [];
+    if (!rawUserId && rawUserName) {
+      const { data, error } = await supabase
+        .from('deals')
+        .select('id,user_id,user_name,source')
+        .eq('user_name', rawUserName);
+      if (error) return res.status(500).json({ error:'Erreur récupération', detail:error.message || '' });
+      rowsByName.push(...(data || []));
+    }
+
+    const rowsByLegacy = [];
+    if (hasLegacyRequest || rawProfileKey.includes('zapier') || rawProfileKey.includes('test')) {
+      const { data, error } = await supabase
+        .from('deals')
+        .select('id,user_id,user_name,source')
+        .or('source.ilike.%iclosed%,source.ilike.%zapier%,user_name.ilike.%zapier%,user_name.ilike.%test%');
+      if (error) return res.status(500).json({ error:'Erreur récupération', detail:error.message || '' });
+      rowsByLegacy.push(...(data || []));
+    }
+
+    const candidates = [...rowsByOwner, ...rowsByName, ...rowsByLegacy];
+    const uniqueIds = [...new Set(candidates.map(row => row.id).filter(Boolean))];
+    if (uniqueIds.length === 0) return res.json({ success:true, deleted:0, matched:0 });
+
+    const { data: deletedRows, error: deleteError } = await supabase
+      .from('deals')
+      .delete()
+      .in('id', uniqueIds)
+      .select('id');
+    if (deleteError) {
+      return res.status(500).json({ error:'Erreur suppression', detail:deleteError.message || '' });
+    }
+
+    const deleted = Array.isArray(deletedRows) ? deletedRows.length : 0;
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'pipeline_profile_purge',
+      req,
+      details: {
+        profile_key: rawProfileKey || null,
+        user_id: rawUserId || null,
+        user_name: rawUserName || null,
+        legacy_source: hasLegacyRequest ? 'iclosed' : null,
+        matched: uniqueIds.length,
+        deleted,
+      },
+    });
+
+    return res.json({ success:true, matched: uniqueIds.length, deleted });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error:'Erreur serveur' });
+  }
 });
 
 // ─── TEAMS ────────────────────────────────────────────────────────────────────
