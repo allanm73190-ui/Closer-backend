@@ -1891,9 +1891,9 @@ app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res
   try {
     const rawUserId = String(req.body?.user_id || '').trim();
     const rawUserName = String(req.body?.user_name || '').trim();
-    const rawLegacySource = String(req.body?.legacy_source || '').trim();
+    const rawCleanupScope = String(req.body?.cleanup_scope || '').trim().toLowerCase();
     const rawProfileKey = String(req.body?.profile_key || '').trim().toLowerCase();
-    const hasLegacyRequest = rawLegacySource.toLowerCase() === 'iclosed';
+    const hasLegacyRequest = rawCleanupScope === 'legacy';
 
     const rowsByOwner = [];
     if (rawUserId) {
@@ -1948,7 +1948,7 @@ app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res
         profile_key: rawProfileKey || null,
         user_id: rawUserId || null,
         user_name: rawUserName || null,
-        legacy_source: hasLegacyRequest ? 'iclosed' : null,
+        cleanup_scope: hasLegacyRequest ? 'legacy' : null,
         matched: uniqueIds.length,
         deleted,
       },
