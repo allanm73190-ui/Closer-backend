@@ -1413,23 +1413,57 @@ app.get('/api/debriefs/:id', authenticate, async (req, res) => {
 
 app.post('/api/debriefs', authenticate, async (req, res) => {
   try {
-    const totals = computeDebriefTotals(req.body.sections || {});
-    const scores = computeSectionScores(req.body.sections || {});
+    const raw = req.body || {};
+    const sections = raw.sections && typeof raw.sections === 'object' ? raw.sections : {};
+    const sectionNotes = raw.section_notes && typeof raw.section_notes === 'object' ? raw.section_notes : {};
+    const totals = computeDebriefTotals(sections);
+    const scores = computeSectionScores(sections);
+
+    const prospectName = sanitizeContactText(raw.prospect_name, 220);
+    if (!prospectName) return res.status(400).json({ error:'Nom du prospect requis' });
+
+    const callDate = sanitizeContactDate(raw.call_date) || new Date().toISOString().slice(0, 10);
+    const closerName = sanitizeContactText(raw.closer_name, 180) || req.user.name;
+    const callLink = sanitizeContactText(raw.call_link, 600) || null;
+    const notes = typeof raw.notes === 'string' ? raw.notes : '';
+    const isClosed = typeof raw.is_closed === 'boolean' ? raw.is_closed : false;
+
     const payload = {
-      ...req.body,
       user_id: req.user.id,
       user_name: req.user.name,
+      prospect_name: prospectName,
+      call_date: callDate,
+      closer_name: closerName,
+      call_link: callLink,
+      is_closed: isClosed,
+      notes,
+      sections,
+      section_notes: sectionNotes,
       total_score: totals.total,
       max_score: totals.max,
       percentage: totals.percentage,
       scores,
     };
+
     const { data: debrief, error } = await supabase.from('debriefs').insert(payload).select().single();
-    if (error) return res.status(500).json({ error:'Erreur création' });
+    if (error) {
+      return res.status(500).json({ error:'Erreur création', detail:error.message || '' });
+    }
     // Auto-créer un deal dans le pipeline si prospect_name fourni
-    await supabase.from('deals').insert({ user_id:req.user.id, user_name:req.user.name, prospect_name:req.body.prospect_name, source:'debrief', status:req.body.is_closed?'signe':'premier_appel', debrief_id:debrief.id, value:0 });
+    await supabase.from('deals').insert({
+      user_id:req.user.id,
+      user_name:req.user.name,
+      prospect_name: prospectName,
+      source:'debrief',
+      status:isClosed ? 'signe' : 'premier_appel',
+      debrief_id:debrief.id,
+      value:0,
+    });
     res.status(201).json({ debrief, gamification:await buildGamification(req.user.id) });
-  } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({ error:'Erreur serveur' });
+  }
 });
 
 app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
