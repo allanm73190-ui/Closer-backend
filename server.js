@@ -1546,7 +1546,6 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
       max_score: totals.max,
       percentage: totals.percentage,
       scores: sectionScores,
-      updated_at: new Date().toISOString(),
     };
 
     const { data: updated, error: updateError } = await supabase
