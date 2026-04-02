@@ -1871,19 +1871,15 @@ app.delete('/api/deals/:id', authenticate, async (req, res) => {
     if (!deal) return res.status(404).json({ error:'Deal introuvable' });
     const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
     if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
-    const { data: deletedRows, error: deleteError } = await supabase
+    const { error: deleteError } = await supabase
       .from('deals')
       .delete()
-      .eq('id', req.params.id)
-      .select('id');
+      .eq('id', req.params.id);
     if (deleteError) {
       const detail = deleteError?.message || 'Suppression impossible';
       return res.status(500).json({ error:'Erreur suppression', detail });
     }
-    if (!Array.isArray(deletedRows) || deletedRows.length === 0) {
-      return res.status(500).json({ error:'Erreur suppression', detail:'Aucune ligne supprimée' });
-    }
-    res.json({ success:true, deleted: deletedRows.length });
+    res.json({ success:true, deleted: 1 });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
@@ -1917,28 +1913,47 @@ app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res
 
     const rowsByLegacy = [];
     if (hasLegacyRequest || rawProfileKey.includes('zapier') || rawProfileKey.includes('test')) {
-      const { data, error } = await supabase
-        .from('deals')
-        .select('id,user_id,user_name,source')
-        .or('source.ilike.%iclosed%,source.ilike.%zapier%,user_name.ilike.%zapier%,user_name.ilike.%test%');
-      if (error) return res.status(500).json({ error:'Erreur récupération', detail:error.message || '' });
-      rowsByLegacy.push(...(data || []));
+      const [
+        sourceLegacy,
+        sourceZapier,
+        userZapier,
+        userTest,
+      ] = await Promise.all([
+        supabase.from('deals').select('id,user_id,user_name,source').ilike('source', '%iclosed%'),
+        supabase.from('deals').select('id,user_id,user_name,source').ilike('source', '%zapier%'),
+        supabase.from('deals').select('id,user_id,user_name,source').ilike('user_name', '%zapier%'),
+        supabase.from('deals').select('id,user_id,user_name,source').ilike('user_name', '%test%'),
+      ]);
+      const errors = [
+        sourceLegacy.error,
+        sourceZapier.error,
+        userZapier.error,
+        userTest.error,
+      ].filter(Boolean);
+      if (errors.length > 0) {
+        return res.status(500).json({ error:'Erreur récupération', detail:errors[0].message || '' });
+      }
+      rowsByLegacy.push(
+        ...(sourceLegacy.data || []),
+        ...(sourceZapier.data || []),
+        ...(userZapier.data || []),
+        ...(userTest.data || []),
+      );
     }
 
     const candidates = [...rowsByOwner, ...rowsByName, ...rowsByLegacy];
     const uniqueIds = [...new Set(candidates.map(row => row.id).filter(Boolean))];
     if (uniqueIds.length === 0) return res.json({ success:true, deleted:0, matched:0 });
 
-    const { data: deletedRows, error: deleteError } = await supabase
-      .from('deals')
-      .delete()
-      .in('id', uniqueIds)
-      .select('id');
+    const { error: deleteError } = await supabase
+        .from('deals')
+        .delete()
+        .in('id', uniqueIds);
     if (deleteError) {
       return res.status(500).json({ error:'Erreur suppression', detail:deleteError.message || '' });
     }
 
-    const deleted = Array.isArray(deletedRows) ? deletedRows.length : 0;
+    const deleted = uniqueIds.length;
     await recordSecurityAudit({
       actorId: req.user.id,
       actorRole: req.user.role,
