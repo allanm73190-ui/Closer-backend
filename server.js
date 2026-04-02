@@ -1432,6 +1432,7 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
     const callDate = sanitizeContactDate(raw.call_date) || new Date().toISOString().slice(0, 10);
     const closerName = sanitizeContactText(raw.closer_name, 180) || req.user.name;
     const callLink = sanitizeContactText(raw.call_link, 600) || null;
+    const linkedDealId = typeof raw.linked_deal_id === 'string' ? raw.linked_deal_id.trim() : '';
     const notes = typeof raw.notes === 'string' ? raw.notes : '';
     const isClosed = typeof raw.is_closed === 'boolean' ? raw.is_closed : false;
 
@@ -1456,16 +1457,44 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
     if (error) {
       return res.status(500).json({ error:'Erreur création', detail:error.message || '' });
     }
-    // Auto-créer un deal dans le pipeline si prospect_name fourni
-    await supabase.from('deals').insert({
-      user_id:req.user.id,
-      user_name:req.user.name,
-      prospect_name: prospectName,
-      source:'debrief',
-      status:isClosed ? 'signe' : 'premier_appel',
-      debrief_id:debrief.id,
-      value:0,
-    });
+
+    let linkedExistingDeal = false;
+    if (linkedDealId) {
+      const { data: existingDeal, error: dealLookupError } = await supabase
+        .from('deals')
+        .select('id,user_id,status')
+        .eq('id', linkedDealId)
+        .single();
+
+      if (!dealLookupError && existingDeal) {
+        const canAccessLinkedDeal = await canUserAccessOwnerData(req.user, existingDeal.user_id);
+        if (canAccessLinkedDeal) {
+          const { error: linkError } = await supabase
+            .from('deals')
+            .update({
+              debrief_id: debrief.id,
+              prospect_name: prospectName,
+              status: isClosed ? 'signe' : (existingDeal.status || 'prospect'),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', existingDeal.id);
+          linkedExistingDeal = !linkError;
+        }
+      }
+    }
+
+    if (!linkedExistingDeal) {
+      // Auto-créer un deal pipeline seulement si aucun lead existant n'a pu être lié
+      await supabase.from('deals').insert({
+        user_id:req.user.id,
+        user_name:req.user.name,
+        prospect_name: prospectName,
+        source:'debrief',
+        status:isClosed ? 'signe' : 'premier_appel',
+        debrief_id:debrief.id,
+        value:0,
+      });
+    }
     res.status(201).json({ debrief, gamification:await buildGamification(req.user.id) });
   } catch(err) {
     console.error(err);
@@ -1493,13 +1522,24 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
     const totals = computeDebriefTotals(nextSections);
     const sectionScores = computeSectionScores(nextSections);
 
+    const nextProspectName = sanitizeContactText(payload.prospect_name ?? existing.prospect_name, 220);
+    if (!nextProspectName) return res.status(400).json({ error:'Nom du prospect requis' });
+    const nextCallDate = sanitizeContactDate(payload.call_date) || sanitizeContactDate(existing.call_date) || new Date().toISOString().slice(0, 10);
+    const nextCloserName = sanitizeContactText(payload.closer_name ?? existing.closer_name, 180) || req.user.name;
+    const nextCallLink = payload.call_link !== undefined
+      ? (sanitizeContactText(payload.call_link, 600) || null)
+      : (existing.call_link || null);
+    const nextNotes = typeof payload.notes === 'string'
+      ? payload.notes
+      : (typeof existing.notes === 'string' ? existing.notes : '');
+
     const updateData = {
-      prospect_name: payload.prospect_name ?? existing.prospect_name,
-      call_date: payload.call_date ?? existing.call_date,
-      closer_name: payload.closer_name ?? existing.closer_name,
-      call_link: payload.call_link ?? existing.call_link,
+      prospect_name: nextProspectName,
+      call_date: nextCallDate,
+      closer_name: nextCloserName,
+      call_link: nextCallLink,
       is_closed: typeof payload.is_closed === 'boolean' ? payload.is_closed : existing.is_closed,
-      notes: payload.notes ?? existing.notes,
+      notes: nextNotes,
       sections: nextSections,
       section_notes: nextSectionNotes,
       total_score: totals.total,
@@ -1515,7 +1555,7 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
       .eq('id', req.params.id)
       .select()
       .single();
-    if (updateError || !updated) return res.status(500).json({ error:'Erreur mise à jour' });
+    if (updateError || !updated) return res.status(500).json({ error:'Erreur mise à jour', detail:updateError?.message || '' });
 
     await supabase
       .from('deals')
