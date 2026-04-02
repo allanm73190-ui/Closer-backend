@@ -325,8 +325,9 @@ async function getHOSTeamMemberIds(hosId) {
 }
 
 async function canUserAccessOwnerData(user, ownerUserId) {
-  if (!user?.id || !ownerUserId) return false;
+  if (!user?.id) return false;
   if (isAdminRole(user.role)) return true;
+  if (!ownerUserId) return false;
   if (ownerUserId === user.id) return true;
   if (!isManagerRole(user.role)) return false;
   const memberIds = await getHOSTeamMemberIds(user.id);
