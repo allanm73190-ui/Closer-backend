@@ -34,7 +34,13 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join('
   .filter(Boolean);
 const AUTH_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_AUTH_MAX || 20);
 const AI_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_AI_MAX || 20);
+const API_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_API_MAX || 600);
 const BODY_LIMIT = process.env.BODY_LIMIT || '1mb';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
+const PASSWORD_MIN_LENGTH = Number(process.env.PASSWORD_MIN_LENGTH || 10);
+const LOGIN_LOCK_MAX_ATTEMPTS = Number(process.env.LOGIN_LOCK_MAX_ATTEMPTS || 6);
+const LOGIN_LOCK_WINDOW_MS = Number(process.env.LOGIN_LOCK_WINDOW_MS || (15 * 60 * 1000));
+const LOGIN_LOCK_DURATION_MS = Number(process.env.LOGIN_LOCK_DURATION_MS || (20 * 60 * 1000));
 
 if (IS_PROD && (!JWT_SECRET || JWT_SECRET === 'change-in-prod')) {
   throw new Error('JWT_SECRET manquant ou non sécurisé. Configurez une valeur unique.');
@@ -62,8 +68,44 @@ const aiLimiter = rateLimit({
   message: { error: 'Trop de requêtes IA. Réessayez dans 1 minute.' },
 });
 
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: API_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de requêtes API. Réessayez dans quelques minutes.' },
+});
+
+const loginAttempts = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, state] of loginAttempts.entries()) {
+    if (!state) {
+      loginAttempts.delete(key);
+      continue;
+    }
+    const latestAttempt = Array.isArray(state.attempts) && state.attempts.length > 0
+      ? Math.max(...state.attempts)
+      : 0;
+    if ((!state.lockUntil || state.lockUntil < now) && now - latestAttempt > LOGIN_LOCK_WINDOW_MS) {
+      loginAttempts.delete(key);
+    }
+  }
+}, 60 * 1000).unref();
+
 app.set('trust proxy', 1);
-app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  contentSecurityPolicy: false,
+  hsts: IS_PROD ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false,
+}));
+app.use((req, res, next) => {
+  const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
+app.use(apiLimiter);
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true); // curl / health checks / apps natives
@@ -286,6 +328,7 @@ const DEFAULT_DEBRIEF_SECTION_CONFIG = [
 const PIPELINE_CONFIG_MARKER = '__pipeline_config__';
 const DEBRIEF_TEMPLATE_CONFIG_MARKER = '__debrief_templates__';
 const APP_SETTINGS_CONFIG_MARKER = '__app_settings__';
+const SECURITY_AUDIT_MARKER = '__security_audit__';
 const DEBRIEF_SECTION_KEYS = new Set(['decouverte', 'reformulation', 'projection', 'presentation_offre', 'closing']);
 const DEFAULT_APP_SETTINGS = {
   theme: 'light',
@@ -416,6 +459,199 @@ function isAppSettingsEnvelope(sections) {
     && sections[0].key === APP_SETTINGS_CONFIG_MARKER
     && typeof sections[0].data === 'object'
     && sections[0].data !== null;
+}
+
+function isSecurityAuditEnvelope(sections) {
+  return Array.isArray(sections)
+    && sections.length === 1
+    && sections[0]
+    && sections[0].key === SECURITY_AUDIT_MARKER
+    && typeof sections[0].data === 'object'
+    && sections[0].data !== null;
+}
+
+function normalizeEmailForSecurity(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeNameForSecurity(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function validatePasswordPolicy(password, context = {}) {
+  const pwd = String(password || '');
+  if (pwd.length < PASSWORD_MIN_LENGTH) {
+    return {
+      ok: false,
+      message: `Le mot de passe doit contenir au moins ${PASSWORD_MIN_LENGTH} caractères.`,
+      code: 'PASSWORD_TOO_SHORT',
+    };
+  }
+
+  const tests = {
+    lower: /[a-z]/.test(pwd),
+    upper: /[A-Z]/.test(pwd),
+    digit: /[0-9]/.test(pwd),
+    symbol: /[^A-Za-z0-9]/.test(pwd),
+  };
+  const score = Object.values(tests).filter(Boolean).length;
+  if (score < 3) {
+    return {
+      ok: false,
+      message: 'Le mot de passe doit combiner au moins 3 éléments: majuscule, minuscule, chiffre, symbole.',
+      code: 'PASSWORD_WEAK_PATTERN',
+    };
+  }
+
+  const blockedPatterns = ['password', 'motdepasse', '123456', 'qwerty', 'azerty', 'closerdebrief'];
+  const lowerPwd = pwd.toLowerCase();
+  for (const pattern of blockedPatterns) {
+    if (lowerPwd.includes(pattern)) {
+      return {
+        ok: false,
+        message: 'Le mot de passe contient un motif trop prévisible.',
+        code: 'PASSWORD_PREDICTABLE',
+      };
+    }
+  }
+
+  const email = normalizeEmailForSecurity(context.email);
+  if (email) {
+    const emailParts = email.split('@')[0]?.split(/[._-]/).filter(Boolean) || [];
+    if (emailParts.some(part => part.length >= 3 && lowerPwd.includes(part))) {
+      return {
+        ok: false,
+        message: "Le mot de passe ne doit pas contenir une partie de l'email.",
+        code: 'PASSWORD_CONTAINS_EMAIL',
+      };
+    }
+  }
+
+  const name = normalizeNameForSecurity(context.name);
+  if (name) {
+    const nameParts = name.split(/\s+/).filter(Boolean);
+    if (nameParts.some(part => part.length >= 3 && lowerPwd.includes(part))) {
+      return {
+        ok: false,
+        message: "Le mot de passe ne doit pas contenir votre prénom ou nom.",
+        code: 'PASSWORD_CONTAINS_NAME',
+      };
+    }
+  }
+
+  return { ok: true, code: 'PASSWORD_OK' };
+}
+
+function getLoginState(email) {
+  const key = normalizeEmailForSecurity(email);
+  if (!key) return { key, locked: false, remainingMs: 0 };
+  const now = Date.now();
+  const state = loginAttempts.get(key);
+  if (!state) return { key, locked: false, remainingMs: 0 };
+
+  const attempts = (state.attempts || []).filter(ts => now - ts <= LOGIN_LOCK_WINDOW_MS);
+  const lockUntil = state.lockUntil || 0;
+  if (attempts.length === 0 && lockUntil < now) {
+    loginAttempts.delete(key);
+    return { key, locked: false, remainingMs: 0 };
+  }
+  state.attempts = attempts;
+  loginAttempts.set(key, state);
+  if (lockUntil > now) {
+    return { key, locked: true, remainingMs: lockUntil - now };
+  }
+  return { key, locked: false, remainingMs: 0 };
+}
+
+function registerLoginFailure(email) {
+  const key = normalizeEmailForSecurity(email);
+  if (!key) return { key, locked: false, remainingMs: 0, attempts: 0 };
+  const now = Date.now();
+  const current = loginAttempts.get(key) || { attempts: [], lockUntil: 0 };
+  const attempts = (current.attempts || []).filter(ts => now - ts <= LOGIN_LOCK_WINDOW_MS);
+  attempts.push(now);
+  let lockUntil = current.lockUntil || 0;
+  if (attempts.length >= LOGIN_LOCK_MAX_ATTEMPTS) {
+    lockUntil = now + LOGIN_LOCK_DURATION_MS;
+  }
+  loginAttempts.set(key, { attempts, lockUntil });
+  return {
+    key,
+    attempts: attempts.length,
+    locked: lockUntil > now,
+    remainingMs: lockUntil > now ? lockUntil - now : 0,
+  };
+}
+
+function clearLoginFailures(email) {
+  const key = normalizeEmailForSecurity(email);
+  if (!key) return;
+  loginAttempts.delete(key);
+}
+
+function getClientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function sanitizeAuditDetails(details) {
+  const forbidden = new Set(['password', 'newPassword', 'currentPassword', 'token', 'authorization', 'jwt']);
+  if (!details || typeof details !== 'object') return {};
+  const result = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (forbidden.has(key)) continue;
+    if (value === undefined) continue;
+    if (value === null) {
+      result[key] = null;
+      continue;
+    }
+    if (typeof value === 'string') {
+      result[key] = value.slice(0, 320);
+      continue;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      result[key] = value;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      result[key] = value.slice(0, 20).map(item => typeof item === 'string' ? item.slice(0, 120) : item);
+      continue;
+    }
+    if (typeof value === 'object') {
+      result[key] = JSON.parse(JSON.stringify(value));
+    }
+  }
+  return result;
+}
+
+async function recordSecurityAudit({
+  actorId,
+  actorRole,
+  action,
+  outcome = 'success',
+  req = null,
+  details = {},
+}) {
+  if (!actorId || !action) return;
+  const payload = {
+    action,
+    outcome,
+    actor_id: actorId,
+    actor_role: actorRole || 'unknown',
+    request_id: req?.requestId || null,
+    ip: req ? getClientIp(req) : null,
+    user_agent: req ? String(req.headers['user-agent'] || '').slice(0, 260) : null,
+    details: sanitizeAuditDetails(details),
+    created_at: new Date().toISOString(),
+  };
+  try {
+    await supabase.from('debrief_config').insert({
+      sections: [{ key: SECURITY_AUDIT_MARKER, data: payload }],
+      updated_by: actorId,
+    });
+  } catch (error) {
+    console.error('Security audit insert error:', error?.message || error);
+  }
 }
 
 function normalizeDebriefTemplateCatalog(catalog) {
@@ -746,7 +982,7 @@ async function getDebriefConfigRecord(scopeOwnerId) {
       .select('id,sections,updated_by,updated_at')
       .eq('updated_by', scopeOwnerId)
       .order('updated_at', { ascending: false })
-      .limit(20);
+      .limit(250);
     const records = data || [];
     return records.find(record => isDebriefConfigSections(record?.sections)) || null;
   } catch {
@@ -770,7 +1006,7 @@ async function getPipelineConfigRecord(scopeOwnerId) {
       .select('id,sections,updated_by,updated_at')
       .eq('updated_by', scopeOwnerId)
       .order('updated_at', { ascending: false })
-      .limit(20);
+      .limit(250);
     const records = data || [];
     return records.find(record => isPipelineConfigEnvelope(record?.sections)) || null;
   } catch {
@@ -795,7 +1031,7 @@ async function getDebriefTemplateRecord(scopeOwnerId) {
       .select('id,sections,updated_by,updated_at')
       .eq('updated_by', scopeOwnerId)
       .order('updated_at', { ascending: false })
-      .limit(20);
+      .limit(250);
     const records = data || [];
     return records.find(record => isDebriefTemplateEnvelope(record?.sections)) || null;
   } catch {
@@ -820,7 +1056,7 @@ async function getAppSettingsRecord(userId) {
       .select('id,sections,updated_by,updated_at')
       .eq('updated_by', userId)
       .order('updated_at', { ascending: false })
-      .limit(20);
+      .limit(250);
     const records = data || [];
     return records.find(record => isAppSettingsEnvelope(record?.sections)) || null;
   } catch {
@@ -842,7 +1078,8 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, password, name, role, invite_code } = req.body;
     if (!email||!password||!name) return res.status(400).json({ error:'Tous les champs sont requis' });
-    if (password.length < 8) return res.status(400).json({ error:'Mot de passe trop court' });
+    const pwdPolicy = validatePasswordPolicy(password, { email, name });
+    if (!pwdPolicy.ok) return res.status(400).json({ error:pwdPolicy.message, code:pwdPolicy.code });
     const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
     if (existing) return res.status(409).json({ error:'Cet email est déjà utilisé' });
     let finalRole = 'closer', teamId = null;
@@ -857,7 +1094,14 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase.from('users').insert({ email, password:hashed, name, role:finalRole, team_id:teamId }).select().single();
     if (error) return res.status(500).json({ error:'Erreur création compte' });
-    const token = jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name }, JWT_SECRET, { expiresIn:'7d' });
+    const token = jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name }, JWT_SECRET, { expiresIn:JWT_EXPIRES_IN });
+    await recordSecurityAudit({
+      actorId: user.id,
+      actorRole: user.role,
+      action: 'auth_register',
+      req,
+      details: { role: user.role, invite_code_used: !!invite_code },
+    });
     res.status(201).json({ token, user:{ id:user.id, email:user.email, name:user.name, role:user.role }, gamification:await buildGamification(user.id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
@@ -866,9 +1110,41 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email||!password) return res.status(400).json({ error:'Email et mot de passe requis' });
+    const lockState = getLoginState(email);
+    if (lockState.locked) {
+      const remainingMinutes = Math.max(1, Math.ceil(lockState.remainingMs / 60000));
+      return res.status(429).json({
+        error: `Compte temporairement verrouillé. Réessayez dans ${remainingMinutes} min.`,
+        code: 'AUTH_LOCKED',
+      });
+    }
     const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
-    if (!user||!(await bcrypt.compare(password, user.password))) return res.status(401).json({ error:'Email ou mot de passe incorrect' });
-    const token = jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name }, JWT_SECRET, { expiresIn:'7d' });
+    if (!user||!(await bcrypt.compare(password, user.password))) {
+      const failureState = registerLoginFailure(email);
+      if (user?.id && failureState.locked) {
+        await recordSecurityAudit({
+          actorId: user.id,
+          actorRole: user.role,
+          action: 'auth_login_locked',
+          outcome: 'failure',
+          req,
+          details: {
+            attempts_in_window: failureState.attempts,
+            lock_minutes: Math.max(1, Math.ceil(failureState.remainingMs / 60000)),
+          },
+        });
+      }
+      if (failureState.locked) {
+        const remainingMinutes = Math.max(1, Math.ceil(failureState.remainingMs / 60000));
+        return res.status(429).json({
+          error: `Compte temporairement verrouillé. Réessayez dans ${remainingMinutes} min.`,
+          code: 'AUTH_LOCKED',
+        });
+      }
+      return res.status(401).json({ error:'Email ou mot de passe incorrect' });
+    }
+    clearLoginFailures(email);
+    const token = jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name }, JWT_SECRET, { expiresIn:JWT_EXPIRES_IN });
     res.json({ token, user:{ id:user.id, email:user.email, name:user.name, role:user.role }, gamification:await buildGamification(user.id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
@@ -894,11 +1170,21 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
 app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body;
   if (!token||!password) return res.status(400).json({ error:'Token et mot de passe requis' });
-  if (password.length < 8) return res.status(400).json({ error:'Trop court' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.type !== 'reset') return res.status(400).json({ error:'Token invalide' });
+    const { data: user } = await supabase.from('users').select('id,email,name,role').eq('id', decoded.id).single();
+    const pwdPolicy = validatePasswordPolicy(password, { email:user?.email, name:user?.name });
+    if (!pwdPolicy.ok) return res.status(400).json({ error:pwdPolicy.message, code:pwdPolicy.code });
     await supabase.from('users').update({ password:await bcrypt.hash(password, 10) }).eq('id', decoded.id);
+    if (user?.id) {
+      await recordSecurityAudit({
+        actorId: user.id,
+        actorRole: user.role || 'closer',
+        action: 'auth_reset_password',
+        req,
+      });
+    }
     res.json({ success:true });
   } catch { return res.status(400).json({ error:'Token invalide ou expiré' }); }
 });
@@ -906,10 +1192,17 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 app.post('/api/auth/change-password', authenticate, authLimiter, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword||!newPassword) return res.status(400).json({ error:'Champs requis' });
-  if (newPassword.length < 8) return res.status(400).json({ error:'Trop court' });
-  const { data: user } = await supabase.from('users').select('password').eq('id', req.user.id).single();
+  const { data: user } = await supabase.from('users').select('password,email,name,role').eq('id', req.user.id).single();
   if (!user||!(await bcrypt.compare(currentPassword, user.password))) return res.status(401).json({ error:'Mot de passe actuel incorrect' });
+  const pwdPolicy = validatePasswordPolicy(newPassword, { email:user.email, name:user.name });
+  if (!pwdPolicy.ok) return res.status(400).json({ error:pwdPolicy.message, code:pwdPolicy.code });
   await supabase.from('users').update({ password:await bcrypt.hash(newPassword, 10) }).eq('id', req.user.id);
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: user.role || req.user.role,
+    action: 'auth_change_password',
+    req,
+  });
   res.json({ success:true });
 });
 
@@ -1453,6 +1746,17 @@ app.post('/api/teams/join-with-code', authenticate, async (req, res) => {
       .update({ used: true, used_at: new Date().toISOString() })
       .eq('id', invite.id);
 
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'team_join_with_code',
+      req,
+      details: {
+        team_id: team.id,
+        invite_code: rawCode,
+      },
+    });
+
     return res.json({ joined: true, team });
   } catch (err) {
     console.error('Join team with code error:', err);
@@ -1481,6 +1785,13 @@ app.post('/api/teams', authenticate, requireHOS, async (req, res) => {
   if (!name?.trim()) return res.status(400).json({ error:'Nom requis' });
   const { data: team, error } = await supabase.from('teams').insert({ name:name.trim(), owner_id:req.user.id }).select().single();
   if (error) return res.status(500).json({ error:'Erreur création' });
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_create',
+    req,
+    details: { team_id: team.id, team_name: team.name },
+  });
   res.status(201).json({ ...team, members:[], inviteCodes:[] });
 });
 
@@ -1490,6 +1801,13 @@ app.patch('/api/teams/:id', authenticate, requireHOS, async (req, res) => {
   const team = await assertTeamOwner(req.params.id, req.user.id);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   const { data } = await supabase.from('teams').update({ name:name.trim() }).eq('id', req.params.id).select().single();
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_rename',
+    req,
+    details: { team_id: req.params.id, team_name: data?.name || name.trim() },
+  });
   res.json(data);
 });
 
@@ -1499,6 +1817,13 @@ app.delete('/api/teams/:id', authenticate, requireHOS, async (req, res) => {
   await supabase.from('users').update({ team_id:null }).eq('team_id', req.params.id);
   await supabase.from('invite_codes').delete().eq('team_id', req.params.id);
   await supabase.from('teams').delete().eq('id', req.params.id);
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_delete',
+    req,
+    details: { team_id: req.params.id },
+  });
   res.json({ success:true });
 });
 
@@ -1508,6 +1833,13 @@ app.post('/api/teams/:id/invite', authenticate, requireHOS, async (req, res) => 
   const code = generateCode();
   const { data: invite, error } = await supabase.from('invite_codes').insert({ code, team_id:req.params.id, created_by:req.user.id, used:false }).select().single();
   if (error) return res.status(500).json({ error:'Erreur génération' });
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_invite_create',
+    req,
+    details: { team_id: req.params.id, invite_code: invite?.code || code },
+  });
   res.json(invite);
 });
 
@@ -1515,6 +1847,13 @@ app.delete('/api/teams/:id/invite/:codeId', authenticate, requireHOS, async (req
   const team = await assertTeamOwner(req.params.id, req.user.id);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('invite_codes').delete().eq('id', req.params.codeId).eq('team_id', req.params.id);
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_invite_delete',
+    req,
+    details: { team_id: req.params.id, code_id: req.params.codeId },
+  });
   res.json({ success:true });
 });
 
@@ -1525,6 +1864,13 @@ app.patch('/api/teams/:id/members/:memberId', authenticate, requireHOS, async (r
   const { data: member } = await supabase.from('users').select('id,team_id').eq('id', req.params.memberId).single();
   if (!member || !(allTeams||[]).map(t=>t.id).includes(member.team_id)) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('users').update({ team_id:req.params.id }).eq('id', req.params.memberId);
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_member_move',
+    req,
+    details: { team_id: req.params.id, member_id: req.params.memberId },
+  });
   res.json({ success:true });
 });
 
@@ -1532,6 +1878,13 @@ app.delete('/api/teams/:id/members/:memberId', authenticate, requireHOS, async (
   const team = await assertTeamOwner(req.params.id, req.user.id);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('users').update({ team_id:null }).eq('id', req.params.memberId).eq('team_id', req.params.id);
+  await recordSecurityAudit({
+    actorId: req.user.id,
+    actorRole: req.user.role,
+    action: 'team_member_remove',
+    req,
+    details: { team_id: req.params.id, member_id: req.params.memberId },
+  });
   res.json({ success:true });
 });
 
@@ -1562,6 +1915,13 @@ app.put('/api/debrief-config', authenticate, requireHOS, async (req, res) => {
     } else {
       await supabase.from('debrief_config').insert({ sections, updated_by: req.user.id });
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'debrief_config_update',
+      req,
+      details: { sections_count: sections.length },
+    });
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1578,6 +1938,12 @@ app.delete('/api/debrief-config', authenticate, requireHOS, async (req, res) => 
     if (ids.length > 0) {
       await supabase.from('debrief_config').delete().in('id', ids);
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'debrief_config_reset',
+      req,
+    });
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1608,6 +1974,13 @@ app.put('/api/pipeline-config', authenticate, requireHOS, async (req, res) => {
     } else {
       await supabase.from('debrief_config').insert({ sections: envelope, updated_by: req.user.id });
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'pipeline_config_update',
+      req,
+      details: { statuses_count: config.statuses?.length || 0 },
+    });
     res.json(config);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1641,6 +2014,13 @@ app.put('/api/debrief-templates', authenticate, requireHOS, async (req, res) => 
     } else {
       await supabase.from('debrief_config').insert({ sections: envelope, updated_by: req.user.id });
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'debrief_templates_update',
+      req,
+      details: { templates_count: catalog.templates?.length || 0, default_template: catalog.defaultTemplateKey || null },
+    });
     res.json(catalog);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1659,6 +2039,12 @@ app.delete('/api/debrief-templates', authenticate, requireHOS, async (req, res) 
     if (ids.length > 0) {
       await supabase.from('debrief_config').delete().in('id', ids);
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'debrief_templates_reset',
+      req,
+    });
     res.json(DEFAULT_DEBRIEF_TEMPLATE_CATALOG);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1694,6 +2080,13 @@ app.put('/api/app-settings', authenticate, async (req, res) => {
     } else {
       await supabase.from('debrief_config').insert({ sections: envelope, updated_by: req.user.id });
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'app_settings_update',
+      req,
+      details: { theme: settings.theme, auto_ai_after_debrief: settings.autoAiAfterDebrief },
+    });
     res.json(settings);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1712,9 +2105,100 @@ app.delete('/api/app-settings', authenticate, async (req, res) => {
     if (ids.length > 0) {
       await supabase.from('debrief_config').delete().in('id', ids);
     }
+    await recordSecurityAudit({
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'app_settings_reset',
+      req,
+    });
     res.json(DEFAULT_APP_SETTINGS);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── SECURITY CENTER ────────────────────────────────────────────────────────
+app.get('/api/security/posture', authenticate, async (req, res) => {
+  res.json({
+    trust_level: 'reinforced',
+    protections: {
+      helmet: true,
+      cors_restricted: true,
+      auth_rate_limit_max: AUTH_RATE_LIMIT_MAX,
+      ai_rate_limit_max: AI_RATE_LIMIT_MAX,
+      api_rate_limit_max: API_RATE_LIMIT_MAX,
+      body_limit: BODY_LIMIT,
+      brute_force_lock: {
+        threshold: LOGIN_LOCK_MAX_ATTEMPTS,
+        window_minutes: Math.round(LOGIN_LOCK_WINDOW_MS / 60000),
+        lock_minutes: Math.round(LOGIN_LOCK_DURATION_MS / 60000),
+      },
+    },
+    password_policy: {
+      min_length: PASSWORD_MIN_LENGTH,
+      required_families: 3,
+      families: ['minuscule', 'majuscule', 'chiffre', 'symbole'],
+      blocked_patterns: ['password', 'motdepasse', '123456', 'qwerty', 'azerty'],
+    },
+    auth: {
+      jwt_expiration: JWT_EXPIRES_IN,
+      session_storage: 'jwt_bearer',
+    },
+    audit: {
+      enabled: true,
+      endpoint: '/api/security/audit',
+    },
+  });
+});
+
+app.get('/api/security/audit', authenticate, async (req, res) => {
+  try {
+    const rawLimit = Number(req.query?.limit || 50);
+    const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(rawLimit, 200)) : 50;
+    const scope = String(req.query?.scope || 'own').toLowerCase();
+
+    let actorIds = [req.user.id];
+    if (req.user.role === 'head_of_sales' && scope === 'team') {
+      const memberIds = await getHOSTeamMemberIds(req.user.id);
+      actorIds = [...new Set([req.user.id, ...memberIds])];
+    }
+
+    const { data, error } = await supabase
+      .from('debrief_config')
+      .select('id,sections,updated_by,updated_at')
+      .in('updated_by', actorIds)
+      .order('updated_at', { ascending: false })
+      .limit(limit * 5);
+    if (error) return res.status(500).json({ error: 'Erreur récupération audit' });
+
+    const events = (data || [])
+      .filter(record => isSecurityAuditEnvelope(record.sections))
+      .map(record => {
+        const payload = record.sections?.[0]?.data || {};
+        return {
+          id: record.id,
+          action: payload.action || 'unknown',
+          outcome: payload.outcome || 'success',
+          actor_id: payload.actor_id || record.updated_by,
+          actor_role: payload.actor_role || 'unknown',
+          request_id: payload.request_id || null,
+          ip: payload.ip || null,
+          user_agent: payload.user_agent || null,
+          details: payload.details || {},
+          created_at: payload.created_at || record.updated_at,
+        };
+      })
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, limit);
+
+    return res.json({
+      scope: req.user.role === 'head_of_sales' && scope === 'team' ? 'team' : 'own',
+      total: events.length,
+      events,
+    });
+  } catch (err) {
+    console.error('Security audit error:', err);
+    return res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 // ─── OBJECTION LIBRARY ───────────────────────────────────────────────────────
@@ -2465,5 +2949,5 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'20' }));
-app.listen(PORT, () => console.log("CloserDebrief API v20 - port " + PORT));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'21' }));
+app.listen(PORT, () => console.log("CloserDebrief API v21 - port " + PORT));
