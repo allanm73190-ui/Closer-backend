@@ -2841,6 +2841,49 @@ Contraintes:
 - Pas de fluff, pas de théorie générale.
 - Ne pas inventer de chiffres: utiliser uniquement les métriques fournies.`;
 
+const AI_EXPORT_SUMMARY_SYSTEM_PROMPT = `Tu es un coach commercial expert en closing.
+Tu respectes strictement la demande utilisateur et les contraintes de format.
+Ta sortie doit être nette, crédible, et fidèle au texte source.`;
+
+const AI_EXPORT_SUMMARY_PROMPT_TEMPLATE = `Agis comme un coach commercial expert en closing et en analyse de calls.
+
+Je vais te donner un débrief de vente. Ta mission est d’en produire un résumé ultra-condensé de 5 à 6 lignes maximum, en ne gardant que les 20 % d’informations qui permettent de comprendre 80 % de l’analyse.
+
+Le résumé doit obligatoirement contenir :
+1. l’évaluation globale de la performance,
+2. ce qui a permis le closing,
+3. la faiblesse structurelle la plus importante,
+4. le risque que cette faiblesse crée sur des prospects plus difficiles,
+5. l’action prioritaire de coaching.
+
+Contraintes de sortie :
+- un seul bloc de texte
+- aucun bullet point
+- aucune redite
+- aucune formule vague
+- ton analytique, net et crédible
+- rester fidèle au texte source
+
+Voici le débrief :
+[COLLE ICI LE TEXTE]`;
+
+function sanitizeExportSummary(rawText) {
+  const lines = String(rawText || '')
+    .replace(/\r/g, '\n')
+    .replace(/\*\*/g, '')
+    .replace(/`/g, '')
+    .split('\n')
+    .map(line => line.trim())
+    .map(line => line.replace(/^[-*•]\s+/, ''))
+    .map(line => line.replace(/^\d+\s*[.)]\s+/, ''))
+    .filter(Boolean);
+
+  let merged = lines.join(' ').replace(/\s+/g, ' ').trim();
+  if (!merged) return '';
+  if (merged.length > 1400) merged = `${merged.slice(0, 1397).trimEnd()}...`;
+  return merged;
+}
+
 function isDateInRange(value, fromDate, toDate) {
   const date = toStartOfDay(value);
   if (!date) return false;
@@ -3121,6 +3164,45 @@ app.get('/api/ai/health', authenticate, async (req, res) => {
     modelCandidates: getAnthropicModelCandidates(),
     runtimeHasFetch: typeof fetch === 'function',
   });
+});
+
+app.post('/api/ai/export-summary', authenticate, aiLimiter, async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée' });
+    }
+
+    const sourceText = String(req.body?.source_text || '').trim();
+    if (!sourceText) {
+      return res.status(400).json({ error: 'source_text requis' });
+    }
+
+    const clippedSource = sourceText.slice(0, 18000);
+    const userPrompt = AI_EXPORT_SUMMARY_PROMPT_TEMPLATE.replace('[COLLE ICI LE TEXTE]', clippedSource);
+
+    const aiResult = await callAnthropicWithFallback(AI_EXPORT_SUMMARY_SYSTEM_PROMPT, userPrompt);
+    if (!aiResult.ok) {
+      console.error('Anthropic export summary error:', aiResult);
+      return res.status(aiResult.status || 502).json({
+        error: 'Erreur API IA',
+        detail: aiResult.message,
+        model: aiResult.modelTried,
+      });
+    }
+
+    const summary = sanitizeExportSummary(aiResult.analysis);
+    if (!summary) {
+      return res.status(502).json({ error: 'Résumé IA vide' });
+    }
+
+    return res.json({
+      summary,
+      model: aiResult.modelUsed || null,
+    });
+  } catch (err) {
+    console.error('AI export summary error:', err);
+    return res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
 
 app.post('/api/ai/analyze', authenticate, aiLimiter, async (req, res) => {
