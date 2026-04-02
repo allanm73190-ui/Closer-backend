@@ -2841,32 +2841,6 @@ Contraintes:
 - Pas de fluff, pas de théorie générale.
 - Ne pas inventer de chiffres: utiliser uniquement les métriques fournies.`;
 
-const AI_EXPORT_COACHING_SYSTEM_PROMPT = `Tu es un coach expert en closing chargé d’évaluer la solidité réelle d’un call de vente, au-delà du simple résultat final.
-
-À partir du débrief fourni, produis une synthèse de coaching qui distingue clairement :
-- ce qui a permis de closer,
-- ce qui aurait pu faire échouer le call sur un prospect plus difficile,
-- la compétence à automatiser en priorité.
-
-Contraintes :
-- Ne te contente pas de dire que la performance est “bonne” parce qu’il y a eu un closing.
-- Analyse la qualité de la structure de vente, pas seulement l’issue.
-- Identifie la faille technique centrale.
-- Mets en évidence tout faux positif de performance.
-- Termine par un plan d’action immédiatement applicable.
-- Pas de markdown décoratif (** ou #). Réponse texte propre uniquement.
-
-Format obligatoire :
-1. Note /100
-2. Verdict global
-3. Forces décisives
-4. Failles structurelles
-5. Risque caché
-6. Pattern du closer
-7. Compétence à automatiser
-8. Script de correction
-9. Action concrète pour les 10 prochains calls`;
-
 function isDateInRange(value, fromDate, toDate) {
   const date = toStartOfDay(value);
   if (!date) return false;
@@ -2958,55 +2932,6 @@ Format attendu: uniquement le script final (sans titre, sans puces).
     });
   } catch (err) {
     console.error('AI objection variant error:', err);
-    return res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-app.post('/api/ai/export-coaching', authenticate, aiLimiter, async (req, res) => {
-  try {
-    if (!ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée' });
-    }
-
-    const debriefText = String(req.body?.debrief_text || '').trim();
-    const debriefId = String(req.body?.debrief_id || '').trim();
-
-    if (!debriefText) {
-      return res.status(400).json({ error: 'debrief_text requis' });
-    }
-
-    if (debriefId) {
-      const { data: debrief, error: debriefError } = await supabase
-        .from('debriefs')
-        .select('id, user_id')
-        .eq('id', debriefId)
-        .single();
-      if (debriefError || !debrief) return res.status(404).json({ error: 'Debrief introuvable' });
-      const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
-      if (!canAccess) return res.status(403).json({ error: 'Accès refusé' });
-    }
-
-    const userPrompt = `Débrief :
-${debriefText}
-
-Respecte strictement le format 1 → 9 demandé.`;
-
-    const aiResult = await callAnthropicWithFallback(AI_EXPORT_COACHING_SYSTEM_PROMPT, userPrompt);
-    if (!aiResult.ok) {
-      console.error('Anthropic export coaching error:', aiResult);
-      return res.status(aiResult.status || 502).json({
-        error: 'Erreur API IA',
-        detail: aiResult.message,
-        model: aiResult.modelTried,
-      });
-    }
-
-    return res.json({
-      analysis: String(aiResult.analysis || '').trim(),
-      model: aiResult.modelUsed,
-    });
-  } catch (err) {
-    console.error('AI export coaching error:', err);
     return res.status(500).json({ error: 'Erreur serveur' });
   }
 });
