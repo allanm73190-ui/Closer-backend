@@ -41,6 +41,13 @@ const PASSWORD_MIN_LENGTH = Number(process.env.PASSWORD_MIN_LENGTH || 10);
 const LOGIN_LOCK_MAX_ATTEMPTS = Number(process.env.LOGIN_LOCK_MAX_ATTEMPTS || 6);
 const LOGIN_LOCK_WINDOW_MS = Number(process.env.LOGIN_LOCK_WINDOW_MS || (15 * 60 * 1000));
 const LOGIN_LOCK_DURATION_MS = Number(process.env.LOGIN_LOCK_DURATION_MS || (20 * 60 * 1000));
+const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ADMIN_EMAILS = new Set(
+  String(process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map(value => String(value || '').trim().toLowerCase())
+    .filter(Boolean)
+);
 
 if (IS_PROD && (!JWT_SECRET || JWT_SECRET === 'change-in-prod')) {
   throw new Error('JWT_SECRET manquant ou non sécurisé. Configurez une valeur unique.');
@@ -231,14 +238,54 @@ function computeDebriefTotals(sections) {
 }
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+function normalizeRole(role) {
+  const normalized = String(role || '').trim().toLowerCase();
+  if (normalized === 'admin') return 'admin';
+  if (normalized === 'head_of_sales') return 'head_of_sales';
+  return 'closer';
+}
+
+function isAdminRole(role) {
+  return normalizeRole(role) === 'admin';
+}
+
+function isManagerRole(role) {
+  const normalized = normalizeRole(role);
+  return normalized === 'head_of_sales' || normalized === 'admin';
+}
+
+function isAdminEmail(email) {
+  const normalized = normalizeEmailForSecurity(email);
+  return normalized ? ADMIN_EMAILS.has(normalized) : false;
+}
+
+function getEffectiveRole(userLike) {
+  if (!userLike) return 'closer';
+  if (isAdminEmail(userLike.email)) return 'admin';
+  return normalizeRole(userLike.role);
+}
+
+function attachEffectiveRole(userLike) {
+  if (!userLike) return userLike;
+  return { ...userLike, role: getEffectiveRole(userLike) };
+}
+
 function authenticate(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error:'Token manquant', code:'AUTH_REQUIRED' });
-  try { req.user = jwt.verify(auth.split(' ')[1], JWT_SECRET); next(); }
+  try {
+    const decoded = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+    req.user = attachEffectiveRole(decoded);
+    next();
+  }
   catch { return res.status(401).json({ error:'Session expirée', code:'TOKEN_EXPIRED' }); }
 }
 function requireHOS(req, res, next) {
-  if (req.user.role !== 'head_of_sales') return res.status(403).json({ error:'Accès réservé aux Head of Sales' });
+  if (!isManagerRole(req.user.role)) return res.status(403).json({ error:'Accès réservé aux Head of Sales / Admin' });
+  next();
+}
+function requireAdmin(req, res, next) {
+  if (!isAdminRole(req.user.role)) return res.status(403).json({ error:'Accès réservé aux Admins' });
   next();
 }
 function generateCode() {
@@ -263,9 +310,11 @@ function buildMemberStats(member, debriefs) {
   const chartData = [...ud].sort((a,b)=>new Date(a.call_date)-new Date(b.call_date)).map(d=>({ date:d.call_date, score:Math.round(d.percentage||0), prospect:d.prospect_name }));
   return { ...member, points, level:computeLevel(points), badges:computeBadges(ud), avgScore, totalDebriefs:ud.length, closed:ud.filter(d=>d.is_closed).length, chartData };
 }
-async function assertTeamOwner(teamId, userId) {
+async function assertTeamOwner(teamId, userId, actorRole = 'head_of_sales') {
   const { data } = await supabase.from('teams').select('id,owner_id').eq('id', teamId).single();
-  if (!data || data.owner_id !== userId) return null;
+  if (!data) return null;
+  if (isAdminRole(actorRole)) return data;
+  if (data.owner_id !== userId) return null;
   return data;
 }
 async function getHOSTeamMemberIds(hosId) {
@@ -277,14 +326,16 @@ async function getHOSTeamMemberIds(hosId) {
 
 async function canUserAccessOwnerData(user, ownerUserId) {
   if (!user?.id || !ownerUserId) return false;
+  if (isAdminRole(user.role)) return true;
   if (ownerUserId === user.id) return true;
-  if (user.role !== 'head_of_sales') return false;
+  if (!isManagerRole(user.role)) return false;
   const memberIds = await getHOSTeamMemberIds(user.id);
   return memberIds.includes(ownerUserId);
 }
 
-async function assertCloserManagedByHOS(hosId, closerId) {
+async function assertCloserManagedByHOS(hosId, closerId, actorRole = 'head_of_sales') {
   if (!hosId || !closerId) return false;
+  if (isAdminRole(actorRole)) return true;
   const { data: closer } = await supabase
     .from('users')
     .select('id,role,team_id')
@@ -301,7 +352,7 @@ async function assertCloserManagedByHOS(hosId, closerId) {
 
 async function getDebriefConfigScopeOwnerId(user) {
   if (!user?.id) return null;
-  if (user.role === 'head_of_sales') return user.id;
+  if (isManagerRole(user.role)) return user.id;
 
   const { data: me } = await supabase
     .from('users')
@@ -859,6 +910,118 @@ function extractObjectionScript(source) {
   return '';
 }
 
+function buildObjectionResponse(debriefs) {
+  const list = Array.isArray(debriefs) ? debriefs : [];
+  const OBJECTION_LABELS = {
+    budget: 'Budget',
+    reflechir: 'Besoin de réfléchir',
+    conjoint: 'Conjoint / Tiers',
+    methode: 'Méthode / Doute produit',
+  };
+  const objMap = {};
+  for (const d of list) {
+    const closing = d.sections?.closing || {};
+    const objections = closing.objections || [];
+    const objectionScript = extractObjectionScript(d);
+    for (const type of objections) {
+      if (type === 'aucune') continue;
+      if (!objMap[type]) objMap[type] = { type, label: OBJECTION_LABELS[type] || type, count: 0, closed: 0, debriefs: [] };
+      objMap[type].count++;
+      if (d.is_closed) objMap[type].closed++;
+      objMap[type].debriefs.push({
+        id: d.id,
+        prospect_name: d.prospect_name,
+        call_date: d.call_date,
+        user_name: d.user_name,
+        is_closed: d.is_closed,
+        percentage: d.percentage,
+        douleur_reancree: closing.douleur_reancree,
+        objection_isolee: closing.objection_isolee,
+        resultat_closing: closing.resultat_closing,
+        notes: d.notes,
+        section_notes_closing: d.section_notes?.closing || {},
+        objection_script: objectionScript,
+      });
+    }
+  }
+
+  const objections = Object.values(objMap)
+    .map(item => {
+      const snippetMap = {};
+      for (const d of item.debriefs) {
+        const script = cleanScriptText(d.objection_script, 420);
+        if (!script) continue;
+        const key = normalizeSnippetKey(script);
+        if (!key) continue;
+        if (!snippetMap[key]) {
+          snippetMap[key] = {
+            text: script,
+            uses: 0,
+            closed: 0,
+            scores: [],
+            examples: [],
+          };
+        }
+        snippetMap[key].uses += 1;
+        if (d.is_closed) snippetMap[key].closed += 1;
+        snippetMap[key].scores.push(Number(d.percentage || 0));
+        if (snippetMap[key].examples.length < 2) {
+          snippetMap[key].examples.push({
+            prospect_name: d.prospect_name || 'Inconnu',
+            call_date: d.call_date,
+            is_closed: !!d.is_closed,
+          });
+        }
+      }
+      const validatedResponses = Object.values(snippetMap)
+        .map(snippet => {
+          const closeRate = snippet.uses > 0 ? Math.round((snippet.closed / snippet.uses) * 100) : 0;
+          const avgScore = snippet.scores.length > 0
+            ? Math.round(snippet.scores.reduce((sum, value) => sum + value, 0) / snippet.scores.length)
+            : 0;
+          return {
+            text: snippet.text,
+            uses: snippet.uses,
+            closeRate,
+            avgScore,
+            validated: snippet.uses >= 2 ? closeRate >= 50 : closeRate >= 80,
+            examples: snippet.examples,
+          };
+        })
+        .sort((a, b) => {
+          if (b.validated !== a.validated) return (b.validated ? 1 : 0) - (a.validated ? 1 : 0);
+          if (b.closeRate !== a.closeRate) return b.closeRate - a.closeRate;
+          if (b.uses !== a.uses) return b.uses - a.uses;
+          return b.avgScore - a.avgScore;
+        })
+        .slice(0, 6);
+
+      return {
+        ...item,
+        closingRate: item.count > 0 ? Math.round((item.closed / item.count) * 100) : 0,
+        bestResponses: item.debriefs
+          .filter(d => d.is_closed)
+          .sort((a, b) => (b.percentage || 0) - (a.percentage || 0))
+          .slice(0, 5),
+        worstCases: item.debriefs
+          .filter(d => !d.is_closed)
+          .sort((a, b) => (a.percentage || 0) - (b.percentage || 0))
+          .slice(0, 3),
+        validatedResponses,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+
+  return {
+    total: list.length,
+    totalWithObjections: list.filter(d => {
+      const objectionsList = d.sections?.closing?.objections || [];
+      return objectionsList.length > 0 && !objectionsList.includes('aucune');
+    }).length,
+    objections,
+  };
+}
+
 function toStartOfDay(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
@@ -1082,9 +1245,18 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     if (!pwdPolicy.ok) return res.status(400).json({ error:pwdPolicy.message, code:pwdPolicy.code });
     const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
     if (existing) return res.status(409).json({ error:'Cet email est déjà utilisé' });
-    let finalRole = 'closer', teamId = null;
-    if (role === 'head_of_sales') { finalRole = 'head_of_sales'; }
-    else {
+    const requestedRole = normalizeRole(role);
+    const adminByEmail = isAdminEmail(email);
+    let finalRole = adminByEmail ? 'admin' : requestedRole;
+    let teamId = null;
+
+    if (finalRole === 'admin') {
+      if (!adminByEmail) {
+        return res.status(403).json({ error:'Création Admin non autorisée pour cet email' });
+      }
+    } else if (finalRole === 'head_of_sales') {
+      teamId = null;
+    } else {
       if (!invite_code) return res.status(400).json({ error:"Code d'invitation requis" });
       const { data: invite } = await supabase.from('invite_codes').select('*').eq('code', invite_code.toUpperCase()).eq('used', false).single();
       if (!invite) return res.status(400).json({ error:"Code invalide ou déjà utilisé" });
@@ -1094,15 +1266,16 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase.from('users').insert({ email, password:hashed, name, role:finalRole, team_id:teamId }).select().single();
     if (error) return res.status(500).json({ error:'Erreur création compte' });
-    const token = jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name }, JWT_SECRET, { expiresIn:JWT_EXPIRES_IN });
+    const effectiveUser = attachEffectiveRole(user);
+    const token = jwt.sign({ id:effectiveUser.id, email:effectiveUser.email, role:effectiveUser.role, name:effectiveUser.name }, JWT_SECRET, { expiresIn:JWT_EXPIRES_IN });
     await recordSecurityAudit({
-      actorId: user.id,
-      actorRole: user.role,
+      actorId: effectiveUser.id,
+      actorRole: effectiveUser.role,
       action: 'auth_register',
       req,
-      details: { role: user.role, invite_code_used: !!invite_code },
+      details: { role: effectiveUser.role, invite_code_used: !!invite_code },
     });
-    res.status(201).json({ token, user:{ id:user.id, email:user.email, name:user.name, role:user.role }, gamification:await buildGamification(user.id) });
+    res.status(201).json({ token, user:{ id:effectiveUser.id, email:effectiveUser.email, name:effectiveUser.name, role:effectiveUser.role }, gamification:await buildGamification(effectiveUser.id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
@@ -1118,7 +1291,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         code: 'AUTH_LOCKED',
       });
     }
-    const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
+    const { data: rawUser } = await supabase.from('users').select('*').eq('email', email).single();
+    const user = attachEffectiveRole(rawUser);
     if (!user||!(await bcrypt.compare(password, user.password))) {
       const failureState = registerLoginFailure(email);
       if (user?.id && failureState.locked) {
@@ -1150,8 +1324,9 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 });
 
 app.get('/api/auth/me', authenticate, async (req, res) => {
-  const { data: user } = await supabase.from('users').select('id,email,name,role').eq('id', req.user.id).single();
-  if (!user) return res.status(404).json({ error:'Utilisateur introuvable' });
+  const { data: rawUser } = await supabase.from('users').select('id,email,name,role').eq('id', req.user.id).single();
+  if (!rawUser) return res.status(404).json({ error:'Utilisateur introuvable' });
+  const user = attachEffectiveRole(rawUser);
   res.json(user);
 });
 
@@ -1178,9 +1353,10 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
     if (!pwdPolicy.ok) return res.status(400).json({ error:pwdPolicy.message, code:pwdPolicy.code });
     await supabase.from('users').update({ password:await bcrypt.hash(password, 10) }).eq('id', decoded.id);
     if (user?.id) {
+      const effectiveRole = getEffectiveRole(user);
       await recordSecurityAudit({
         actorId: user.id,
-        actorRole: user.role || 'closer',
+        actorRole: effectiveRole,
         action: 'auth_reset_password',
         req,
       });
@@ -1197,9 +1373,10 @@ app.post('/api/auth/change-password', authenticate, authLimiter, async (req, res
   const pwdPolicy = validatePasswordPolicy(newPassword, { email:user.email, name:user.name });
   if (!pwdPolicy.ok) return res.status(400).json({ error:pwdPolicy.message, code:pwdPolicy.code });
   await supabase.from('users').update({ password:await bcrypt.hash(newPassword, 10) }).eq('id', req.user.id);
+  const effectiveRole = getEffectiveRole(user);
   await recordSecurityAudit({
     actorId: req.user.id,
-    actorRole: user.role || req.user.role,
+    actorRole: effectiveRole,
     action: 'auth_change_password',
     req,
   });
@@ -1209,8 +1386,13 @@ app.post('/api/auth/change-password', authenticate, authLimiter, async (req, res
 // ─── DEBRIEFS ─────────────────────────────────────────────────────────────────
 app.get('/api/debriefs', authenticate, async (req, res) => {
   try {
+    if (isAdminRole(req.user.role)) {
+      const { data, error } = await supabase.from('debriefs').select('*').order('call_date', { ascending:false });
+      if (error) return res.status(500).json({ error:'Erreur récupération' });
+      return res.json(data || []);
+    }
     let ids = [req.user.id];
-    if (req.user.role === 'head_of_sales') {
+    if (normalizeRole(req.user.role) === 'head_of_sales') {
       const memberIds = await getHOSTeamMemberIds(req.user.id);
       ids = [...new Set([req.user.id, ...memberIds])];
     }
@@ -1360,7 +1542,7 @@ app.delete('/api/comments/:id', authenticate, async (req, res) => {
   if (!c) return res.status(404).json({ error:'Introuvable' });
   const isAuthor = c.author_id === req.user.id;
   if (!isAuthor) {
-    if (req.user.role !== 'head_of_sales') return res.status(403).json({ error:'Accès refusé' });
+    if (!isManagerRole(req.user.role)) return res.status(403).json({ error:'Accès refusé' });
     const { data: debrief } = await supabase
       .from('debriefs')
       .select('user_id')
@@ -1380,7 +1562,7 @@ app.get('/api/gamification/leaderboard', authenticate, async (req, res) => {
   const { data: users } = await supabase.from('users').select('id,name,role');
   const { data: allDebriefs } = await supabase.from('debriefs').select('percentage,is_closed,user_id');
   if (!users||!allDebriefs) return res.json([]);
-  const board = users.filter(u=>u.role!=='head_of_sales').map(u => {
+  const board = users.filter(u => !isManagerRole(u.role)).map(u => {
     const ud = allDebriefs.filter(d=>d.user_id===u.id);
     const points = ud.reduce((s,d)=>s+computePoints(d),0);
     const avgScore = ud.length>0?Math.round(ud.reduce((s,d)=>s+(d.percentage||0),0)/ud.length):0;
@@ -1444,7 +1626,7 @@ app.get('/api/objectives/me', authenticate, async (req, res) => {
 // GET objectifs d'un closer (HOS)
 app.get('/api/objectives/closer/:closerId', authenticate, requireHOS, async (req, res) => {
   try {
-    const allowed = await assertCloserManagedByHOS(req.user.id, req.params.closerId);
+    const allowed = await assertCloserManagedByHOS(req.user.id, req.params.closerId, req.user.role);
     if (!allowed) return res.status(403).json({ error:'Accès refusé' });
     const { data } = await supabase.from('objectives').select('*').eq('closer_id', req.params.closerId).order('period_start', { ascending:false });
     res.json((data || []).map(mapObjectiveAliases));
@@ -1466,7 +1648,7 @@ app.post('/api/objectives', authenticate, requireHOS, async (req, res) => {
       target_revenue,
     } = req.body;
     if (!closer_id||!period_type||!period_start) return res.status(400).json({ error:'Champs requis' });
-    const allowed = await assertCloserManagedByHOS(req.user.id, closer_id);
+    const allowed = await assertCloserManagedByHOS(req.user.id, closer_id, req.user.role);
     if (!allowed) return res.status(403).json({ error:'Accès refusé' });
 
     const normalizedTargets = {
@@ -1512,7 +1694,7 @@ app.get('/api/action-plans/me', authenticate, async (req, res) => {
 });
 
 app.get('/api/action-plans/closer/:closerId', authenticate, requireHOS, async (req, res) => {
-  const allowed = await assertCloserManagedByHOS(req.user.id, req.params.closerId);
+  const allowed = await assertCloserManagedByHOS(req.user.id, req.params.closerId, req.user.role);
   if (!allowed) return res.status(403).json({ error:'Accès refusé' });
   const { data } = await supabase.from('action_plans').select('*').eq('closer_id', req.params.closerId).order('created_at', { ascending:false });
   res.json(data || []);
@@ -1521,7 +1703,7 @@ app.get('/api/action-plans/closer/:closerId', authenticate, requireHOS, async (r
 app.post('/api/action-plans', authenticate, requireHOS, async (req, res) => {
   const { closer_id, axis, description } = req.body;
   if (!closer_id||!axis) return res.status(400).json({ error:'Champs requis' });
-  const allowed = await assertCloserManagedByHOS(req.user.id, closer_id);
+  const allowed = await assertCloserManagedByHOS(req.user.id, closer_id, req.user.role);
   if (!allowed) return res.status(403).json({ error:'Accès refusé' });
   // Max 3 plans actifs par closer
   const { data: active } = await supabase.from('action_plans').select('id').eq('closer_id', closer_id).eq('status', 'active');
@@ -1541,10 +1723,14 @@ app.patch('/api/action-plans/:id', authenticate, async (req, res) => {
 
   if (req.user.role === 'closer') {
     if (existing.closer_id !== req.user.id) return res.status(403).json({ error:'Accès refusé' });
-  } else if (req.user.role === 'head_of_sales') {
-    const isOwner = existing.hos_id === req.user.id;
-    const managesCloser = await assertCloserManagedByHOS(req.user.id, existing.closer_id);
-    if (!isOwner && !managesCloser) return res.status(403).json({ error:'Accès refusé' });
+  } else if (isManagerRole(req.user.role)) {
+    if (isAdminRole(req.user.role)) {
+      // accès total admin
+    } else {
+      const isOwner = existing.hos_id === req.user.id;
+      const managesCloser = await assertCloserManagedByHOS(req.user.id, existing.closer_id, req.user.role);
+      if (!isOwner && !managesCloser) return res.status(403).json({ error:'Accès refusé' });
+    }
   } else {
     return res.status(403).json({ error:'Accès refusé' });
   }
@@ -1565,9 +1751,11 @@ app.delete('/api/action-plans/:id', authenticate, requireHOS, async (req, res) =
     .eq('id', req.params.id)
     .single();
   if (!existing) return res.status(404).json({ error:'Plan introuvable' });
-  const isOwner = existing.hos_id === req.user.id;
-  const managesCloser = await assertCloserManagedByHOS(req.user.id, existing.closer_id);
-  if (!isOwner && !managesCloser) return res.status(403).json({ error:'Accès refusé' });
+  if (!isAdminRole(req.user.role)) {
+    const isOwner = existing.hos_id === req.user.id;
+    const managesCloser = await assertCloserManagedByHOS(req.user.id, existing.closer_id, req.user.role);
+    if (!isOwner && !managesCloser) return res.status(403).json({ error:'Accès refusé' });
+  }
   await supabase.from('action_plans').delete().eq('id', req.params.id);
   res.json({ success:true });
 });
@@ -1575,8 +1763,13 @@ app.delete('/api/action-plans/:id', authenticate, requireHOS, async (req, res) =
 // ─── DEALS / PIPELINE ─────────────────────────────────────────────────────────
 app.get('/api/deals', authenticate, async (req, res) => {
   try {
+    if (isAdminRole(req.user.role)) {
+      const { data, error } = await supabase.from('deals').select('*').order('updated_at', { ascending:false });
+      if (error) return res.status(500).json({ error:'Erreur récupération' });
+      return res.json((data || []).map(mapDealForClient));
+    }
     let ids = [req.user.id];
-    if (req.user.role === 'head_of_sales') {
+    if (normalizeRole(req.user.role) === 'head_of_sales') {
       const memberIds = await getHOSTeamMemberIds(req.user.id);
       ids = [...new Set([req.user.id, ...memberIds])];
     }
@@ -1710,7 +1903,7 @@ app.get('/api/teams/me', authenticate, async (req, res) => {
 
 app.post('/api/teams/join-with-code', authenticate, async (req, res) => {
   try {
-    if (req.user.role !== 'closer') {
+    if (normalizeRole(req.user.role) !== 'closer') {
       return res.status(403).json({ error: 'Action réservée aux closers' });
     }
 
@@ -1766,7 +1959,10 @@ app.post('/api/teams/join-with-code', authenticate, async (req, res) => {
 
 app.get('/api/teams', authenticate, requireHOS, async (req, res) => {
   try {
-    const { data: teams } = await supabase.from('teams').select('*').eq('owner_id', req.user.id).order('created_at', { ascending:true });
+    const teamsQuery = supabase.from('teams').select('*').order('created_at', { ascending:true });
+    const { data: teams } = isAdminRole(req.user.role)
+      ? await teamsQuery
+      : await teamsQuery.eq('owner_id', req.user.id);
     if (!teams?.length) return res.json([]);
     const teamIds = teams.map(t=>t.id);
     const [{ data: allMembers }, { data: allCodes }] = await Promise.all([
@@ -1798,7 +1994,7 @@ app.post('/api/teams', authenticate, requireHOS, async (req, res) => {
 app.patch('/api/teams/:id', authenticate, requireHOS, async (req, res) => {
   const { name } = req.body;
   if (!name?.trim()) return res.status(400).json({ error:'Nom requis' });
-  const team = await assertTeamOwner(req.params.id, req.user.id);
+  const team = await assertTeamOwner(req.params.id, req.user.id, req.user.role);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   const { data } = await supabase.from('teams').update({ name:name.trim() }).eq('id', req.params.id).select().single();
   await recordSecurityAudit({
@@ -1812,7 +2008,7 @@ app.patch('/api/teams/:id', authenticate, requireHOS, async (req, res) => {
 });
 
 app.delete('/api/teams/:id', authenticate, requireHOS, async (req, res) => {
-  const team = await assertTeamOwner(req.params.id, req.user.id);
+  const team = await assertTeamOwner(req.params.id, req.user.id, req.user.role);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('users').update({ team_id:null }).eq('team_id', req.params.id);
   await supabase.from('invite_codes').delete().eq('team_id', req.params.id);
@@ -1828,7 +2024,7 @@ app.delete('/api/teams/:id', authenticate, requireHOS, async (req, res) => {
 });
 
 app.post('/api/teams/:id/invite', authenticate, requireHOS, async (req, res) => {
-  const team = await assertTeamOwner(req.params.id, req.user.id);
+  const team = await assertTeamOwner(req.params.id, req.user.id, req.user.role);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   const code = generateCode();
   const { data: invite, error } = await supabase.from('invite_codes').insert({ code, team_id:req.params.id, created_by:req.user.id, used:false }).select().single();
@@ -1844,7 +2040,7 @@ app.post('/api/teams/:id/invite', authenticate, requireHOS, async (req, res) => 
 });
 
 app.delete('/api/teams/:id/invite/:codeId', authenticate, requireHOS, async (req, res) => {
-  const team = await assertTeamOwner(req.params.id, req.user.id);
+  const team = await assertTeamOwner(req.params.id, req.user.id, req.user.role);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('invite_codes').delete().eq('id', req.params.codeId).eq('team_id', req.params.id);
   await recordSecurityAudit({
@@ -1858,11 +2054,14 @@ app.delete('/api/teams/:id/invite/:codeId', authenticate, requireHOS, async (req
 });
 
 app.patch('/api/teams/:id/members/:memberId', authenticate, requireHOS, async (req, res) => {
-  const team = await assertTeamOwner(req.params.id, req.user.id);
+  const team = await assertTeamOwner(req.params.id, req.user.id, req.user.role);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
-  const { data: allTeams } = await supabase.from('teams').select('id').eq('owner_id', req.user.id);
   const { data: member } = await supabase.from('users').select('id,team_id').eq('id', req.params.memberId).single();
-  if (!member || !(allTeams||[]).map(t=>t.id).includes(member.team_id)) return res.status(403).json({ error:'Accès refusé' });
+  if (!member) return res.status(403).json({ error:'Accès refusé' });
+  if (!isAdminRole(req.user.role)) {
+    const { data: allTeams } = await supabase.from('teams').select('id').eq('owner_id', req.user.id);
+    if (!(allTeams||[]).map(t=>t.id).includes(member.team_id)) return res.status(403).json({ error:'Accès refusé' });
+  }
   await supabase.from('users').update({ team_id:req.params.id }).eq('id', req.params.memberId);
   await recordSecurityAudit({
     actorId: req.user.id,
@@ -1875,7 +2074,7 @@ app.patch('/api/teams/:id/members/:memberId', authenticate, requireHOS, async (r
 });
 
 app.delete('/api/teams/:id/members/:memberId', authenticate, requireHOS, async (req, res) => {
-  const team = await assertTeamOwner(req.params.id, req.user.id);
+  const team = await assertTeamOwner(req.params.id, req.user.id, req.user.role);
   if (!team) return res.status(403).json({ error:'Accès refusé' });
   await supabase.from('users').update({ team_id:null }).eq('id', req.params.memberId).eq('team_id', req.params.id);
   await recordSecurityAudit({
@@ -2118,7 +2317,7 @@ app.delete('/api/app-settings', authenticate, async (req, res) => {
 });
 
 // ─── SECURITY CENTER ────────────────────────────────────────────────────────
-app.get('/api/security/posture', authenticate, async (req, res) => {
+app.get('/api/security/posture', authenticate, requireAdmin, async (req, res) => {
   res.json({
     trust_level: 'reinforced',
     protections: {
@@ -2151,28 +2350,37 @@ app.get('/api/security/posture', authenticate, async (req, res) => {
   });
 });
 
-app.get('/api/security/audit', authenticate, async (req, res) => {
+app.get('/api/security/audit', authenticate, requireAdmin, async (req, res) => {
   try {
     const rawLimit = Number(req.query?.limit || 50);
     const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(rawLimit, 200)) : 50;
-    const scope = String(req.query?.scope || 'own').toLowerCase();
+    const requestedScope = String(req.query?.scope || 'all').toLowerCase();
+    const scope = requestedScope === 'own' ? 'own' : 'all';
+    const actorIds = scope === 'own' ? [req.user.id] : [];
 
-    let actorIds = [req.user.id];
-    if (req.user.role === 'head_of_sales' && scope === 'team') {
-      const memberIds = await getHOSTeamMemberIds(req.user.id);
-      actorIds = [...new Set([req.user.id, ...memberIds])];
-    }
-
-    const { data, error } = await supabase
+    let query = supabase
       .from('debrief_config')
       .select('id,sections,updated_by,updated_at')
-      .in('updated_by', actorIds)
       .order('updated_at', { ascending: false })
-      .limit(limit * 5);
-    if (error) return res.status(500).json({ error: 'Erreur récupération audit' });
+      .limit(limit * 10);
+
+    if (scope === 'own') {
+      const validIds = actorIds.filter(id => UUID_V4_REGEX.test(String(id || '')));
+      if (validIds.length === 0) {
+        return res.json({ scope, total: 0, events: [] });
+      }
+      query = query.in('updated_by', validIds);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('Security audit query error:', error?.message || error);
+      return res.json({ scope, total: 0, events: [], warning: 'AUDIT_QUERY_FAILED' });
+    }
 
     const events = (data || [])
       .filter(record => isSecurityAuditEnvelope(record.sections))
+      .filter(record => scope === 'all' || actorIds.includes(record.updated_by))
       .map(record => {
         const payload = record.sections?.[0]?.data || {};
         return {
@@ -2192,20 +2400,28 @@ app.get('/api/security/audit', authenticate, async (req, res) => {
       .slice(0, limit);
 
     return res.json({
-      scope: req.user.role === 'head_of_sales' && scope === 'team' ? 'team' : 'own',
+      scope,
       total: events.length,
       events,
     });
   } catch (err) {
     console.error('Security audit error:', err);
-    return res.status(500).json({ error: 'Erreur serveur' });
+    return res.json({ scope: 'all', total: 0, events: [], warning: 'AUDIT_RUNTIME_ERROR' });
   }
 });
 // ─── OBJECTION LIBRARY ───────────────────────────────────────────────────────
 app.get('/api/objections', authenticate, async (req, res) => {
   try {
+    if (isAdminRole(req.user.role)) {
+      const { data: debriefs, error } = await supabase
+        .from('debriefs')
+        .select('id, user_id, user_name, prospect_name, call_date, is_closed, percentage, sections, section_notes, notes')
+        .order('call_date', { ascending: false });
+      if (error) return res.status(500).json({ error: 'Erreur récupération' });
+      return res.json(buildObjectionResponse(debriefs || []));
+    }
     let ids = [req.user.id];
-    if (req.user.role === 'head_of_sales') {
+    if (normalizeRole(req.user.role) === 'head_of_sales') {
       const memberIds = await getHOSTeamMemberIds(req.user.id);
       ids = [...new Set([req.user.id, ...memberIds])];
     }
@@ -2215,98 +2431,7 @@ app.get('/api/objections', authenticate, async (req, res) => {
       .in('user_id', ids)
       .order('call_date', { ascending: false });
     if (error) return res.status(500).json({ error: 'Erreur récupération' });
-    const OBJECTION_LABELS = {
-      budget: 'Budget', reflechir: 'Besoin de réfléchir',
-      conjoint: 'Conjoint / Tiers', methode: 'Méthode / Doute produit',
-    };
-    const objMap = {};
-    for (const d of (debriefs || [])) {
-      const closing = d.sections?.closing || {};
-      const objections = closing.objections || [];
-      const objectionScript = extractObjectionScript(d);
-      for (const type of objections) {
-        if (type === 'aucune') continue;
-        if (!objMap[type]) objMap[type] = { type, label: OBJECTION_LABELS[type] || type, count: 0, closed: 0, debriefs: [] };
-        objMap[type].count++;
-        if (d.is_closed) objMap[type].closed++;
-        objMap[type].debriefs.push({
-          id: d.id, prospect_name: d.prospect_name, call_date: d.call_date,
-          user_name: d.user_name, is_closed: d.is_closed, percentage: d.percentage,
-          douleur_reancree: closing.douleur_reancree, objection_isolee: closing.objection_isolee,
-          resultat_closing: closing.resultat_closing, notes: d.notes,
-          section_notes_closing: d.section_notes?.closing || {},
-          objection_script: objectionScript,
-        });
-      }
-    }
-    const result = Object.values(objMap)
-      .map(o => {
-        const snippetMap = {};
-        for (const d of o.debriefs) {
-          const script = cleanScriptText(d.objection_script, 420);
-          if (!script) continue;
-          const key = normalizeSnippetKey(script);
-          if (!key) continue;
-          if (!snippetMap[key]) {
-            snippetMap[key] = {
-              text: script,
-              uses: 0,
-              closed: 0,
-              scores: [],
-              examples: [],
-            };
-          }
-          snippetMap[key].uses += 1;
-          if (d.is_closed) snippetMap[key].closed += 1;
-          snippetMap[key].scores.push(Number(d.percentage || 0));
-          if (snippetMap[key].examples.length < 2) {
-            snippetMap[key].examples.push({
-              prospect_name: d.prospect_name || 'Inconnu',
-              call_date: d.call_date,
-              is_closed: !!d.is_closed,
-            });
-          }
-        }
-        const validatedResponses = Object.values(snippetMap)
-          .map(snippet => {
-            const closeRate = snippet.uses > 0 ? Math.round((snippet.closed / snippet.uses) * 100) : 0;
-            const avgScore = snippet.scores.length > 0
-              ? Math.round(snippet.scores.reduce((sum, value) => sum + value, 0) / snippet.scores.length)
-              : 0;
-            return {
-              text: snippet.text,
-              uses: snippet.uses,
-              closeRate,
-              avgScore,
-              validated: snippet.uses >= 2 ? closeRate >= 50 : closeRate >= 80,
-              examples: snippet.examples,
-            };
-          })
-          .sort((a, b) => {
-            if (b.validated !== a.validated) return (b.validated ? 1 : 0) - (a.validated ? 1 : 0);
-            if (b.closeRate !== a.closeRate) return b.closeRate - a.closeRate;
-            if (b.uses !== a.uses) return b.uses - a.uses;
-            return b.avgScore - a.avgScore;
-          })
-          .slice(0, 6);
-
-        return {
-          ...o,
-          closingRate: o.count > 0 ? Math.round((o.closed / o.count) * 100) : 0,
-          bestResponses: o.debriefs.filter(d => d.is_closed).sort((a, b) => (b.percentage || 0) - (a.percentage || 0)).slice(0, 5),
-          worstCases: o.debriefs.filter(d => !d.is_closed).sort((a, b) => (a.percentage || 0) - (b.percentage || 0)).slice(0, 3),
-          validatedResponses,
-        };
-      })
-      .sort((a, b) => b.count - a.count);
-    res.json({
-      total: (debriefs || []).length,
-      totalWithObjections: (debriefs || []).filter(d => {
-        const objs = d.sections?.closing?.objections || [];
-        return objs.length > 0 && !objs.includes('aucune');
-      }).length,
-      objections: result,
-    });
+    res.json(buildObjectionResponse(debriefs || []));
   } catch (err) { console.error('Objections error:', err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -2317,9 +2442,20 @@ app.get('/api/patterns', authenticate, async (req, res) => {
     let scope = 'personal';
     const targetCloserId = String(req.query?.closer_id || '').trim();
 
-    if (req.user.role === 'head_of_sales') {
+    if (isAdminRole(req.user.role)) {
       if (targetCloserId) {
-        const allowed = await assertCloserManagedByHOS(req.user.id, targetCloserId);
+        ids = [targetCloserId];
+        scope = 'closer';
+      } else {
+        const { data: users } = await supabase.from('users').select('id,role');
+        ids = (users || [])
+          .filter(user => normalizeRole(user.role) === 'closer')
+          .map(user => user.id);
+        scope = 'team';
+      }
+    } else if (normalizeRole(req.user.role) === 'head_of_sales') {
+      if (targetCloserId) {
+        const allowed = await assertCloserManagedByHOS(req.user.id, targetCloserId, req.user.role);
         if (!allowed) return res.status(403).json({ error: 'Accès refusé' });
         ids = [targetCloserId];
         scope = 'closer';
@@ -2621,7 +2757,15 @@ Format attendu: uniquement le script final (sans titre, sans puces).
 
 app.get('/api/ai/manager-summary', authenticate, requireHOS, aiLimiter, async (req, res) => {
   try {
-    const memberIds = await getHOSTeamMemberIds(req.user.id);
+    let memberIds = [];
+    if (isAdminRole(req.user.role)) {
+      const { data: users } = await supabase.from('users').select('id,role');
+      memberIds = (users || [])
+        .filter(user => normalizeRole(user.role) === 'closer')
+        .map(user => user.id);
+    } else {
+      memberIds = await getHOSTeamMemberIds(req.user.id);
+    }
     if (!memberIds.length) {
       return res.json({
         period: null,
