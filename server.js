@@ -233,7 +233,7 @@ function computeDebriefTotals(sections) {
   add(c.resultat_closing, ['close', 'retrograde', 'relance'], 1);
 
   const percentage = maxRaw > 0 ? Math.round((pts / maxRaw) * 100) : 0;
-  const score20 = maxRaw > 0 ? Math.round(((pts / maxRaw) * 20) * 10) / 10 : 0;
+  const score20 = maxRaw > 0 ? Math.round((pts / maxRaw) * 20) : 0;
   return { total: score20, max: 20, percentage, raw_total: pts, raw_max: maxRaw };
 }
 
