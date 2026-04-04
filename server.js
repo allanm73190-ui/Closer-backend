@@ -868,8 +868,12 @@ function mapDealForClient(deal) {
   const parsed = parseDealNotes(deal?.notes);
   const meta = normalizeContactMeta(parsed.meta || {}, deal?.status);
   const note = typeof parsed.note === 'string' ? parsed.note : '';
+  const resolvedStatus = typeof deal?.status === 'string' && deal.status.trim()
+    ? deal.status.trim()
+    : (meta.deal_closed ? 'signe' : 'prospect');
   return {
     ...deal,
+    status: resolvedStatus,
     notes: note,
     note,
     first_name: meta.first_name || '',
@@ -1465,19 +1469,41 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
     if (!prospectName) return res.status(400).json({ error:'Nom du prospect requis' });
 
     const callDate = sanitizeContactDate(raw.call_date) || new Date().toISOString().slice(0, 10);
-    const closerName = sanitizeContactText(raw.closer_name, 180) || req.user.name;
+    const closerName = sanitizeContactText(raw.closer_name, 180);
     const callLink = sanitizeContactText(raw.call_link, 600) || null;
     const linkedDealId = typeof raw.linked_deal_id === 'string' ? raw.linked_deal_id.trim() : '';
     const notes = typeof raw.notes === 'string' ? raw.notes : '';
     const isClosed = typeof raw.is_closed === 'boolean' ? raw.is_closed : false;
-    const pipelineContext = await getPipelineStatusContextForUser(req.user);
+    let linkedDeal = null;
+    if (linkedDealId) {
+      const { data: existingDeal, error: dealLookupError } = await supabase
+        .from('deals')
+        .select('id,user_id,user_name,status')
+        .eq('id', linkedDealId)
+        .single();
+      if (!dealLookupError && existingDeal) {
+        const canAccessLinkedDeal = await canUserAccessOwnerData(req.user, existingDeal.user_id);
+        if (!canAccessLinkedDeal) {
+          return res.status(403).json({ error:'Accès refusé' });
+        }
+        linkedDeal = existingDeal;
+      }
+    }
+
+    const ownerUserId = linkedDeal?.user_id || req.user.id;
+    let ownerUserName = linkedDeal?.user_name || req.user.name;
+    if (ownerUserId !== req.user.id) {
+      const ownerUser = await getUserWithEffectiveRole(ownerUserId);
+      if (ownerUser?.name) ownerUserName = ownerUser.name;
+    }
+    const pipelineContext = await getPipelineStatusContextForOwnerId(ownerUserId);
 
     const payload = {
-      user_id: req.user.id,
-      user_name: req.user.name,
+      user_id: ownerUserId,
+      user_name: ownerUserName,
       prospect_name: prospectName,
       call_date: callDate,
-      closer_name: closerName,
+      closer_name: closerName || ownerUserName,
       call_link: callLink,
       is_closed: isClosed,
       notes,
@@ -1495,40 +1521,29 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
     }
 
     let linkedExistingDeal = false;
-    if (linkedDealId) {
-      const { data: existingDeal, error: dealLookupError } = await supabase
+    if (linkedDeal) {
+      const existingStatus = typeof linkedDeal.status === 'string' ? linkedDeal.status : '';
+      const existingIsClosed = pipelineContext.closedKeys.has(existingStatus);
+      const nextStatus = isClosed
+        ? pipelineContext.wonKey
+        : (existingStatus && !existingIsClosed ? existingStatus : pipelineContext.openKey);
+      const { error: linkError } = await supabase
         .from('deals')
-        .select('id,user_id,status')
-        .eq('id', linkedDealId)
-        .single();
-
-      if (!dealLookupError && existingDeal) {
-        const canAccessLinkedDeal = await canUserAccessOwnerData(req.user, existingDeal.user_id);
-        if (canAccessLinkedDeal) {
-          const existingStatus = typeof existingDeal.status === 'string' ? existingDeal.status : '';
-          const existingIsClosed = pipelineContext.closedKeys.has(existingStatus);
-          const nextStatus = isClosed
-            ? pipelineContext.wonKey
-            : (existingStatus && !existingIsClosed ? existingStatus : pipelineContext.openKey);
-          const { error: linkError } = await supabase
-            .from('deals')
-            .update({
-              debrief_id: debrief.id,
-              prospect_name: prospectName,
-              status: nextStatus,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', existingDeal.id);
-          linkedExistingDeal = !linkError;
-        }
-      }
+        .update({
+          debrief_id: debrief.id,
+          prospect_name: prospectName,
+          status: nextStatus,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', linkedDeal.id);
+      linkedExistingDeal = !linkError;
     }
 
-    if (!linkedExistingDeal && !linkedDealId) {
-      // Auto-créer un deal pipeline seulement si aucun lead existant n'a pu être lié
+    if (!linkedExistingDeal && !linkedDeal) {
+      // Auto-créer un deal pipeline si aucun lead existant n'a pu être lié
       await supabase.from('deals').insert({
-        user_id:req.user.id,
-        user_name:req.user.name,
+        user_id: ownerUserId,
+        user_name: ownerUserName,
         prospect_name: prospectName,
         source:'debrief',
         status:isClosed ? pipelineContext.wonKey : pipelineContext.openKey,
@@ -1536,7 +1551,7 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
         value:0,
       });
     }
-    res.status(201).json({ debrief, gamification:await buildGamification(req.user.id) });
+    res.status(201).json({ debrief, gamification:await buildGamification(ownerUserId) });
   } catch(err) {
     console.error(err);
     res.status(500).json({ error:'Erreur serveur' });
