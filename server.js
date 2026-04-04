@@ -240,7 +240,7 @@ function computeDebriefTotals(sections) {
   add(c.resultat_closing, ['close', 'retrograde', 'relance'], 1);
 
   const percentage = maxRaw > 0 ? Math.round((pts / maxRaw) * 100) : 0;
-  const score20 = maxRaw > 0 ? Math.round((pts / maxRaw) * 20) : 0;
+  const score20 = maxRaw > 0 ? Math.round(((pts / maxRaw) * 20) * 10) / 10 : 0;
   return { total: score20, max: 20, percentage, raw_total: pts, raw_max: maxRaw };
 }
 
@@ -375,6 +375,41 @@ async function getDebriefConfigScopeOwnerId(user) {
     .eq('id', me.team_id)
     .single();
   return team?.owner_id || user.id;
+}
+
+async function getUserWithEffectiveRole(userId) {
+  if (!userId) return null;
+  const { data: rawUser } = await supabase
+    .from('users')
+    .select('id,email,name,role')
+    .eq('id', userId)
+    .single();
+  if (!rawUser) return null;
+  return attachEffectiveRole(rawUser);
+}
+
+function extractPipelineStatusContext(config) {
+  const statuses = Array.isArray(config?.statuses) && config.statuses.length > 0
+    ? config.statuses
+    : DEFAULT_PIPELINE_CONFIG.statuses;
+  const wonKey = statuses.find(status => status.won)?.key
+    || statuses.find(status => status.closed)?.key
+    || 'signe';
+  const openKey = statuses.find(status => !status.closed)?.key || 'prospect';
+  const closedKeys = new Set(statuses.filter(status => status.closed).map(status => status.key));
+  return { statuses, wonKey, openKey, closedKeys };
+}
+
+async function getPipelineStatusContextForUser(userLike) {
+  const scopeOwnerId = await getDebriefConfigScopeOwnerId(userLike);
+  const config = await getActivePipelineConfig(scopeOwnerId);
+  return extractPipelineStatusContext(config);
+}
+
+async function getPipelineStatusContextForOwnerId(ownerUserId) {
+  const ownerUser = await getUserWithEffectiveRole(ownerUserId);
+  if (!ownerUser) return extractPipelineStatusContext(DEFAULT_PIPELINE_CONFIG);
+  return getPipelineStatusContextForUser(ownerUser);
 }
 
 const DEFAULT_DEBRIEF_SECTION_CONFIG = [
@@ -1435,6 +1470,7 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
     const linkedDealId = typeof raw.linked_deal_id === 'string' ? raw.linked_deal_id.trim() : '';
     const notes = typeof raw.notes === 'string' ? raw.notes : '';
     const isClosed = typeof raw.is_closed === 'boolean' ? raw.is_closed : false;
+    const pipelineContext = await getPipelineStatusContextForUser(req.user);
 
     const payload = {
       user_id: req.user.id,
@@ -1469,12 +1505,17 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
       if (!dealLookupError && existingDeal) {
         const canAccessLinkedDeal = await canUserAccessOwnerData(req.user, existingDeal.user_id);
         if (canAccessLinkedDeal) {
+          const existingStatus = typeof existingDeal.status === 'string' ? existingDeal.status : '';
+          const existingIsClosed = pipelineContext.closedKeys.has(existingStatus);
+          const nextStatus = isClosed
+            ? pipelineContext.wonKey
+            : (existingStatus && !existingIsClosed ? existingStatus : pipelineContext.openKey);
           const { error: linkError } = await supabase
             .from('deals')
             .update({
               debrief_id: debrief.id,
               prospect_name: prospectName,
-              status: isClosed ? 'signe' : (existingDeal.status || 'prospect'),
+              status: nextStatus,
               updated_at: new Date().toISOString(),
             })
             .eq('id', existingDeal.id);
@@ -1483,14 +1524,14 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
       }
     }
 
-    if (!linkedExistingDeal) {
+    if (!linkedExistingDeal && !linkedDealId) {
       // Auto-créer un deal pipeline seulement si aucun lead existant n'a pu être lié
       await supabase.from('deals').insert({
         user_id:req.user.id,
         user_name:req.user.name,
         prospect_name: prospectName,
         source:'debrief',
-        status:isClosed ? 'signe' : 'premier_appel',
+        status:isClosed ? pipelineContext.wonKey : pipelineContext.openKey,
         debrief_id:debrief.id,
         value:0,
       });
@@ -1556,13 +1597,20 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
       .single();
     if (updateError || !updated) return res.status(500).json({ error:'Erreur mise à jour', detail:updateError?.message || '' });
 
+    const pipelineContext = await getPipelineStatusContextForOwnerId(existing.user_id);
+    const dealUpdateData = {
+      prospect_name: updateData.prospect_name,
+      updated_at: new Date().toISOString(),
+    };
+    if (updateData.is_closed) {
+      dealUpdateData.status = pipelineContext.wonKey;
+    } else if (existing.is_closed && !updateData.is_closed) {
+      dealUpdateData.status = pipelineContext.openKey;
+    }
+
     await supabase
       .from('deals')
-      .update({
-        prospect_name: updateData.prospect_name,
-        status: updateData.is_closed ? 'signe' : 'premier_appel',
-        updated_at: new Date().toISOString(),
-      })
+      .update(dealUpdateData)
       .eq('debrief_id', existing.id);
 
     const gamification = await buildGamification(existing.user_id);
@@ -1866,9 +1914,10 @@ app.post('/api/deals', authenticate, async (req, res) => {
   if (!prospect_name) return res.status(400).json({ error:'Nom du prospect requis' });
 
   const contactMeta = normalizeContactMeta(payload, payload.status);
+  const pipelineContext = await getPipelineStatusContextForUser(req.user);
   const status = typeof payload.status === 'string' && payload.status.trim()
     ? payload.status.trim()
-    : (contactMeta.deal_closed ? 'signe' : 'prospect');
+    : (contactMeta.deal_closed ? pipelineContext.wonKey : pipelineContext.openKey);
   const note = payload.note ?? payload.notes ?? '';
   const source = sanitizeContactText(payload.source, 120);
   const value = Number(payload.value || 0) || 0;
@@ -1900,6 +1949,7 @@ app.patch('/api/deals/:id', authenticate, async (req, res) => {
     if (!deal) return res.status(404).json({ error:'Deal introuvable' });
     const canAccess = await canUserAccessOwnerData(req.user, deal.user_id);
     if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
+    const pipelineContext = await getPipelineStatusContextForOwnerId(deal.user_id);
 
     const payload = req.body || {};
     const previous = parseDealNotes(deal.notes);
@@ -1915,9 +1965,13 @@ app.patch('/api/deals/:id', authenticate, async (req, res) => {
 
     const prospect_name = inferProspectName(payload, `${nextMeta.first_name || ''} ${nextMeta.last_name || ''}`.trim() || deal.prospect_name);
     const explicitStatus = typeof payload.status === 'string' && payload.status.trim() ? payload.status.trim() : '';
+    const currentStatus = typeof deal.status === 'string' ? deal.status : '';
+    const currentIsClosed = pipelineContext.closedKeys.has(currentStatus);
     const status = explicitStatus || (typeof nextMeta.deal_closed === 'boolean'
-      ? (nextMeta.deal_closed ? 'signe' : (deal.status === 'signe' ? 'prospect' : deal.status || 'prospect'))
-      : deal.status || 'prospect');
+      ? (nextMeta.deal_closed
+        ? pipelineContext.wonKey
+        : (currentIsClosed ? pipelineContext.openKey : (currentStatus || pipelineContext.openKey)))
+      : (currentStatus || pipelineContext.openKey));
     const note = payload.note ?? payload.notes ?? previous.note ?? '';
     const follow_up_date = sanitizeContactDate(payload.contact_date || payload.follow_up_date || nextMeta.contact_date || deal.follow_up_date) || null;
 
