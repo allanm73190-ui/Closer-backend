@@ -3726,22 +3726,32 @@ app.post('/api/auth/logout', (req, res) => {
 // Ref: https://developer.calendly.com/api-docs/87c367837296c-webhook-signatures
 app.post('/api/webhooks/calendly', express.raw({ type: '*/*' }), async (req, res) => {
   try {
-    // 1 — Signature verification
-    if (CALENDLY_SIGNING_KEY) {
+    // 1 — Signature verification (read from env at request time for testability)
+    const signingKey = process.env.CALENDLY_SIGNING_KEY || '';
+    if (signingKey) {
       const signatureHeader = req.headers['calendly-webhook-signature'] || '';
       const parts = Object.fromEntries(signatureHeader.split(',').map(p => p.split('=')));
       const t = parts.t || '';
       const v1 = parts.v1 || '';
       if (!t || !v1) return res.status(400).json({ error: 'Missing signature headers' });
-      const dataToSign = t + '.' + req.body.toString('utf8');
-      const expected = crypto.createHmac('sha256', CALENDLY_SIGNING_KEY).update(dataToSign).digest('hex');
-      if (!crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expected, 'hex'))) {
+      const rawBodyStr = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body || '{}');
+      const expected = crypto.createHmac('sha256', signingKey).update(t + '.' + rawBodyStr).digest('hex');
+      const expectedBuf = Buffer.from(expected, 'hex');
+      const receivedBuf = Buffer.from(v1.length === 64 ? v1 : '0'.repeat(64), 'hex');
+      if (!crypto.timingSafeEqual(receivedBuf, expectedBuf) || v1.length !== 64) {
         return res.status(403).json({ error: 'Invalid signature' });
       }
     }
 
-    // 2 — Parse payload
-    const payload = JSON.parse(req.body.toString('utf8'));
+    // 2 — Parse payload (handle both raw Buffer and pre-parsed JSON from express.json())
+    let payload;
+    if (Buffer.isBuffer(req.body)) {
+      payload = JSON.parse(req.body.toString('utf8'));
+    } else if (req.body && typeof req.body === 'object') {
+      payload = req.body; // already parsed by express.json()
+    } else {
+      payload = JSON.parse(String(req.body || '{}'));
+    }
     if (payload.event !== 'invitee.created') return res.status(200).json({ ok: true }); // ignore other events
 
     const invitee  = payload.payload?.invitee || {};
