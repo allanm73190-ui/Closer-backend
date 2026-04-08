@@ -9,6 +9,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const cookieParser = require('cookie-parser');
 const { computeDebriefQuality } = require('./lib/debriefQuality');
+const { validateSections } = require('./lib/validateDebriefSections');
 
 // ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
 const FEATURE_DEBRIEF_QUALITY = String(process.env.FEATURE_DEBRIEF_QUALITY || 'true').toLowerCase() !== 'false';
@@ -302,6 +303,13 @@ function attachEffectiveRole(userLike) {
   return { ...userLike, role: getEffectiveRole(userLike) };
 }
 
+function parsePagination(query) {
+  const page   = Math.max(1, parseInt(query.page)  || 1);
+  const limit  = Math.min(100, Math.max(1, parseInt(query.limit) || 20));
+  const offset = (page - 1) * limit;
+  return { page, limit, offset };
+}
+
 function authenticate(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error:'Token manquant', code:'AUTH_REQUIRED' });
@@ -349,11 +357,17 @@ async function assertTeamOwner(teamId, userId, actorRole = 'head_of_sales') {
   if (data.owner_id !== userId) return null;
   return data;
 }
+const _hosTeamCache = new Map();
+const _HOS_CACHE_TTL = 5 * 60 * 1000;
 async function getHOSTeamMemberIds(hosId) {
+  const cached = _hosTeamCache.get(hosId);
+  if (cached && Date.now() < cached.expiry) return cached.ids;
   const { data: teams } = await supabase.from('teams').select('id').eq('owner_id', hosId);
-  if (!teams?.length) return [];
+  if (!teams?.length) { _hosTeamCache.set(hosId, { ids: [], expiry: Date.now() + _HOS_CACHE_TTL }); return []; }
   const { data: members } = await supabase.from('users').select('id').in('team_id', teams.map(t=>t.id));
-  return (members||[]).map(m => m.id);
+  const ids = (members||[]).map(m => m.id);
+  _hosTeamCache.set(hosId, { ids, expiry: Date.now() + _HOS_CACHE_TTL });
+  return ids;
 }
 
 async function canUserAccessOwnerData(user, ownerUserId) {
@@ -1460,19 +1474,20 @@ app.post('/api/auth/change-password', authenticate, authLimiter, async (req, res
 // ─── DEBRIEFS ─────────────────────────────────────────────────────────────────
 app.get('/api/debriefs', authenticate, async (req, res) => {
   try {
+    const { page, limit, offset } = parsePagination(req.query);
     if (isAdminRole(req.user.role)) {
-      const { data, error } = await supabase.from('debriefs').select('*').order('call_date', { ascending:false });
+      const { data, error, count } = await supabase.from('debriefs').select('*', { count: 'exact' }).order('call_date', { ascending:false }).range(offset, offset + limit - 1);
       if (error) return res.status(500).json({ error:'Erreur récupération' });
-      return res.json(data || []);
+      return res.json({ data: data || [], meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
     }
     let ids = [req.user.id];
     if (normalizeRole(req.user.role) === 'head_of_sales') {
       const memberIds = await getHOSTeamMemberIds(req.user.id);
       ids = [...new Set([req.user.id, ...memberIds])];
     }
-    const { data, error } = await supabase.from('debriefs').select('*').in('user_id', ids).order('call_date', { ascending:false });
+    const { data, error, count } = await supabase.from('debriefs').select('*', { count: 'exact' }).in('user_id', ids).order('call_date', { ascending:false }).range(offset, offset + limit - 1);
     if (error) return res.status(500).json({ error:'Erreur récupération' });
-    res.json(data);
+    res.json({ data: data || [], meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
@@ -1487,6 +1502,10 @@ app.get('/api/debriefs/:id', authenticate, async (req, res) => {
 app.post('/api/debriefs', authenticate, async (req, res) => {
   try {
     const raw = req.body || {};
+    if (raw.sections !== undefined) {
+      const sv = validateSections(raw.sections);
+      if (!sv.valid) return res.status(400).json({ error: sv.error });
+    }
     const sections = raw.sections && typeof raw.sections === 'object' ? raw.sections : {};
     const sectionNotes = raw.section_notes && typeof raw.section_notes === 'object' ? raw.section_notes : {};
     const totals = computeDebriefTotals(sections);
@@ -1970,19 +1989,20 @@ app.delete('/api/action-plans/:id', authenticate, requireHOS, async (req, res) =
 // ─── DEALS / PIPELINE ─────────────────────────────────────────────────────────
 app.get('/api/deals', authenticate, async (req, res) => {
   try {
+    const { page, limit, offset } = parsePagination(req.query);
     if (isAdminRole(req.user.role)) {
-      const { data, error } = await supabase.from('deals').select('*').order('updated_at', { ascending:false });
+      const { data, error, count } = await supabase.from('deals').select('*', { count: 'exact' }).order('updated_at', { ascending:false }).range(offset, offset + limit - 1);
       if (error) return res.status(500).json({ error:'Erreur récupération' });
-      return res.json((data || []).map(mapDealForClient));
+      return res.json({ data: (data || []).map(mapDealForClient), meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
     }
     let ids = [req.user.id];
     if (normalizeRole(req.user.role) === 'head_of_sales') {
       const memberIds = await getHOSTeamMemberIds(req.user.id);
       ids = [...new Set([req.user.id, ...memberIds])];
     }
-    const { data, error } = await supabase.from('deals').select('*').in('user_id', ids).order('updated_at', { ascending:false });
+    const { data, error, count } = await supabase.from('deals').select('*', { count: 'exact' }).in('user_id', ids).order('updated_at', { ascending:false }).range(offset, offset + limit - 1);
     if (error) return res.status(500).json({ error:'Erreur récupération' });
-    res.json((data || []).map(mapDealForClient));
+    res.json({ data: (data || []).map(mapDealForClient), meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
