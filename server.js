@@ -28,6 +28,7 @@ const SUPABASE_URL      = process.env.SUPABASE_URL      || '';
 const SUPABASE_KEY      = process.env.SUPABASE_KEY      || '';
 const JWT_SECRET        = process.env.JWT_SECRET        || 'change-in-prod';
 const RESEND_API_KEY    = process.env.RESEND_API_KEY    || '';
+const emailService      = require('./lib/email.service');
 const APP_URL           = process.env.APP_URL           || 'https://closerdebrief.vercel.app';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL   = process.env.ANTHROPIC_MODEL   || 'claude-sonnet-4-20250514';
@@ -311,10 +312,15 @@ function parsePagination(query) {
 }
 
 function authenticate(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error:'Token manquant', code:'AUTH_REQUIRED' });
+  // Support httpOnly cookie (preferred) or Authorization Bearer header (legacy/mobile)
+  let token = req.cookies?.cd_token;
+  if (!token) {
+    const auth = req.headers.authorization;
+    if (auth?.startsWith('Bearer ')) token = auth.split(' ')[1];
+  }
+  if (!token) return res.status(401).json({ error:'Token manquant', code:'AUTH_REQUIRED' });
   try {
-    const decoded = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
     req.user = attachEffectiveRole(decoded);
     next();
   }
@@ -334,14 +340,21 @@ function generateCode() {
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
+const _gamCache = new Map();
+const _GAM_TTL  = 30 * 1000; // 30s cache
+function invalidateGamCache(userId) { _gamCache.delete(userId); }
 async function buildGamification(userId) {
+  const cached = _gamCache.get(userId);
+  if (cached && Date.now() < cached.expiry) return cached.data;
   const { data } = await supabase.from('debriefs').select('percentage,is_closed').eq('user_id', userId).order('created_at', { ascending:true });
   const list = data || [];
   const points     = list.reduce((s,d) => s+computePoints(d), 0);
   const prevPoints = list.slice(0,-1).reduce((s,d) => s+computePoints(d), 0);
   const pointsEarned = list.length > 0 ? computePoints(list[list.length-1]) : 0;
   const level = computeLevel(points), prevLevel = computeLevel(prevPoints);
-  return { points, pointsEarned, level, prevLevel, levelUp:level.name!==prevLevel.name&&list.length>0, badges:computeBadges(list), totalDebriefs:list.length };
+  const result = { points, pointsEarned, level, prevLevel, levelUp:level.name!==prevLevel.name&&list.length>0, badges:computeBadges(list), totalDebriefs:list.length };
+  _gamCache.set(userId, { data: result, expiry: Date.now() + _GAM_TTL });
+  return result;
 }
 function buildMemberStats(member, debriefs) {
   const ud = debriefs.filter(d => d.user_id === member.id);
@@ -1424,9 +1437,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   const { data: user } = await supabase.from('users').select('id,name').eq('email', email).single();
   if (!user) return res.json({ success:true });
   const resetToken = jwt.sign({ id:user.id, type:'reset' }, JWT_SECRET, { expiresIn:'1h' });
-  if (RESEND_API_KEY) {
-    await fetch('https://api.resend.com/emails', { method:'POST', headers:{ Authorization:`Bearer ${RESEND_API_KEY}`, 'Content-Type':'application/json' }, body:JSON.stringify({ from:'CloserDebrief <onboarding@resend.dev>', to:email, subject:'Réinitialisation mot de passe', html:`<div style="font-family:Arial;max-width:480px;margin:0 auto"><h2 style="color:#6366f1">CloserDebrief</h2><p>Bonjour ${user.name},</p><a href="${APP_URL}?reset_token=${resetToken}" style="display:inline-block;background:#6366f1;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Réinitialiser</a><p style="color:#94a3b8;font-size:12px;margin-top:24px">Expire dans 1h.</p></div>` }) }).catch(console.error);
-  }
+  await emailService.sendPasswordReset({ to: email, name: user.name, resetToken });
   res.json({ success:true });
 });
 
@@ -1621,6 +1632,7 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
         value:0,
       });
     }
+    invalidateGamCache(ownerUserId);
     res.status(201).json({ debrief, gamification:await buildGamification(ownerUserId) });
   } catch(err) {
     console.error(err);
@@ -1710,6 +1722,7 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
       .update(dealUpdateData)
       .eq('debrief_id', existing.id);
 
+    invalidateGamCache(existing.user_id);
     const gamification = await buildGamification(existing.user_id);
     res.json({ debrief: updated, gamification });
   } catch (err) {
@@ -1725,6 +1738,7 @@ app.delete('/api/debriefs/:id', authenticate, async (req, res) => {
     const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
     if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
     await supabase.from('debriefs').delete().eq('id', req.params.id);
+    invalidateGamCache(debrief.user_id);
     res.json({ success:true, gamification:await buildGamification(debrief.user_id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
