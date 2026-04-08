@@ -29,6 +29,7 @@ const SUPABASE_KEY      = process.env.SUPABASE_KEY      || '';
 const JWT_SECRET        = process.env.JWT_SECRET        || 'change-in-prod';
 const RESEND_API_KEY        = process.env.RESEND_API_KEY        || '';
 const CALENDLY_SIGNING_KEY  = process.env.CALENDLY_SIGNING_KEY  || '';
+const GOOGLE_CLIENT_ID      = process.env.GOOGLE_CLIENT_ID      || '';
 const emailService          = require('./lib/email.service');
 const loginAttempts_mod     = require('./lib/login-attempts');
 const crypto                = require('crypto');
@@ -2429,7 +2430,33 @@ app.post('/api/webhooks/calendly', express.raw({ type: '*/*' }), async (req, res
   }
 });
 
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'22', features: { debrief_quality: FEATURE_DEBRIEF_QUALITY, manager_cockpit: FEATURE_MANAGER_COCKPIT } }));
+// ─── GOOGLE CALENDAR INTEGRATION ─────────────────────────────────────────────
+const { syncCalendarForUser } = require('./routes/integrations');
+require('./routes/integrations')(app, { authenticate, supabase });
+
+// Background sync every 30 minutes (only when Google is configured)
+if (GOOGLE_CLIENT_ID) {
+  const SYNC_INTERVAL = 30 * 60 * 1000;
+  const runGlobalSync = async () => {
+    try {
+      const { data: integrations } = await supabase
+        .from('user_integrations')
+        .select('user_id')
+        .eq('gcal_sync_enabled', true)
+        .not('google_refresh_token', 'is', null);
+      for (const row of (integrations || [])) {
+        await syncCalendarForUser(row.user_id, supabase).catch(e =>
+          console.error('[GCal bg sync]', row.user_id, e.message)
+        );
+      }
+    } catch (e) { console.error('[GCal bg sync global]', e.message); }
+  };
+  setInterval(runGlobalSync, SYNC_INTERVAL);
+  // First run after 2 minutes on boot
+  setTimeout(runGlobalSync, 2 * 60 * 1000);
+}
+
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'23', features: { debrief_quality: FEATURE_DEBRIEF_QUALITY, manager_cockpit: FEATURE_MANAGER_COCKPIT, google_calendar: !!GOOGLE_CLIENT_ID } }));
 // Sentry error handler (must be last middleware)
 if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app);
 
