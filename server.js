@@ -7,6 +7,7 @@ const helmet   = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
+const cookieParser = require('cookie-parser');
 const { computeDebriefQuality } = require('./lib/debriefQuality');
 
 // ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
@@ -116,7 +117,16 @@ setInterval(() => {
 app.set('trust proxy', 1);
 app.use(helmet({
   crossOriginResourcePolicy: false,
-  contentSecurityPolicy: false,
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc:  ["'self'", "'unsafe-inline'"],
+      styleSrc:   ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc:    ["'self'", 'https://fonts.gstatic.com'],
+      imgSrc:     ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'", process.env.SUPABASE_URL || ''].filter(Boolean),
+    },
+  },
   hsts: IS_PROD ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false,
 }));
 app.use((req, res, next) => {
@@ -134,9 +144,11 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 }));
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
+app.use(cookieParser());
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -1335,6 +1347,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       req,
       details: { role: effectiveUser.role, invite_code_used: !!invite_code },
     });
+    setAuthCookie(res, token);
     res.status(201).json({ token, user:{ id:effectiveUser.id, email:effectiveUser.email, name:effectiveUser.name, role:effectiveUser.role }, gamification:await buildGamification(effectiveUser.id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
@@ -1379,6 +1392,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     }
     clearLoginFailures(email);
     const token = jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name }, JWT_SECRET, { expiresIn:JWT_EXPIRES_IN });
+    setAuthCookie(res, token);
     res.json({ token, user:{ id:user.id, email:user.email, name:user.name, role:user.role }, gamification:await buildGamification(user.id) });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
@@ -3643,5 +3657,24 @@ app.get('/api/manager/decision-feed', authenticate, requireHOS, async (req, res)
   } catch (err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
+
+function setAuthCookie(res, token) {
+  const IS_PROD = process.env.NODE_ENV === 'production';
+  res.cookie('cd_token', token, {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: IS_PROD ? 'none' : 'lax',
+    maxAge: 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+}
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('cd_token', { path: '/' });
+  res.json({ ok: true });
+});
+
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'22', features: { debrief_quality: FEATURE_DEBRIEF_QUALITY, manager_cockpit: FEATURE_MANAGER_COCKPIT } }));
-app.listen(PORT, () => console.log("CloserDebrief API v21 - port " + PORT));
+if (require.main === module) {
+  app.listen(PORT, () => console.log("CloserDebrief API v22 - port " + PORT));
+}
+module.exports = app;
