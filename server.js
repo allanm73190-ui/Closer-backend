@@ -27,8 +27,21 @@ const app = express();
 const SUPABASE_URL      = process.env.SUPABASE_URL      || '';
 const SUPABASE_KEY      = process.env.SUPABASE_KEY      || '';
 const JWT_SECRET        = process.env.JWT_SECRET        || 'change-in-prod';
-const RESEND_API_KEY    = process.env.RESEND_API_KEY    || '';
-const emailService      = require('./lib/email.service');
+const RESEND_API_KEY        = process.env.RESEND_API_KEY        || '';
+const CALENDLY_SIGNING_KEY  = process.env.CALENDLY_SIGNING_KEY  || '';
+const emailService          = require('./lib/email.service');
+const crypto                = require('crypto');
+// ─── SENTRY ───────────────────────────────────────────────────────────────────
+const Sentry = require('@sentry/node');
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || 'development',
+    tracesSampleRate: 0.1,
+  });
+}
+
+
 const APP_URL           = process.env.APP_URL           || 'https://closerdebrief.vercel.app';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL   = process.env.ANTHROPIC_MODEL   || 'claude-sonnet-4-20250514';
@@ -3707,7 +3720,75 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+
+// ─── CALENDLY WEBHOOK ────────────────────────────────────────────────────────
+// Verify Calendly HMAC-SHA256 signature then create a lead in the pipeline.
+// Ref: https://developer.calendly.com/api-docs/87c367837296c-webhook-signatures
+app.post('/api/webhooks/calendly', express.raw({ type: '*/*' }), async (req, res) => {
+  try {
+    // 1 — Signature verification
+    if (CALENDLY_SIGNING_KEY) {
+      const signatureHeader = req.headers['calendly-webhook-signature'] || '';
+      const parts = Object.fromEntries(signatureHeader.split(',').map(p => p.split('=')));
+      const t = parts.t || '';
+      const v1 = parts.v1 || '';
+      if (!t || !v1) return res.status(400).json({ error: 'Missing signature headers' });
+      const dataToSign = t + '.' + req.body.toString('utf8');
+      const expected = crypto.createHmac('sha256', CALENDLY_SIGNING_KEY).update(dataToSign).digest('hex');
+      if (!crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expected, 'hex'))) {
+        return res.status(403).json({ error: 'Invalid signature' });
+      }
+    }
+
+    // 2 — Parse payload
+    const payload = JSON.parse(req.body.toString('utf8'));
+    if (payload.event !== 'invitee.created') return res.status(200).json({ ok: true }); // ignore other events
+
+    const invitee  = payload.payload?.invitee || {};
+    const event    = payload.payload?.scheduled_event || payload.payload?.event || {};
+    const memberships = event.event_memberships || [];
+
+    const inviteeName  = invitee.name  || 'Inconnu';
+    const inviteeEmail = invitee.email || '';
+    const startTime    = event.start_time || null;
+
+    // 3 — Find organizer user in DB (match by email)
+    const organizerEmail = memberships[0]?.user_email || '';
+    let ownerUser = null;
+    if (organizerEmail) {
+      const { data } = await supabase.from('users').select('id,role').eq('email', organizerEmail).single();
+      ownerUser = data;
+    }
+    if (!ownerUser) return res.status(200).json({ ok: true, note: 'organizer not found in DB' });
+
+    // 4 — Create lead in pipeline
+    const note = [
+      inviteeEmail ? `Email : ${inviteeEmail}` : '',
+      startTime    ? `RDV : ${new Date(startTime).toLocaleString('fr-FR', { timeZone: 'Europe/Paris' })}` : '',
+      payload.payload?.event_type?.name ? `Type : ${payload.payload.event_type.name}` : '',
+    ].filter(Boolean).join('\n');
+
+    await supabase.from('deals').insert({
+      user_id:      ownerUser.id,
+      prospect_name: inviteeName,
+      source:       'calendly',
+      value:        0,
+      status:       'prospect',
+      notes:        note,
+      follow_up_date: startTime ? startTime.split('T')[0] : null,
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('[Calendly webhook]', err);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'22', features: { debrief_quality: FEATURE_DEBRIEF_QUALITY, manager_cockpit: FEATURE_MANAGER_COCKPIT } }));
+// Sentry error handler (must be last middleware)
+if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app);
+
 if (require.main === module) {
   app.listen(PORT, () => console.log("CloserDebrief API v22 - port " + PORT));
 }
