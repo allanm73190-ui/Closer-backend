@@ -7,6 +7,19 @@ const helmet   = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
+const { computeDebriefQuality } = require('./lib/debriefQuality');
+
+// ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
+const FEATURE_DEBRIEF_QUALITY = String(process.env.FEATURE_DEBRIEF_QUALITY || 'true').toLowerCase() !== 'false';
+const FEATURE_MANAGER_COCKPIT = String(process.env.FEATURE_MANAGER_COCKPIT || 'true').toLowerCase() !== 'false';
+
+// ─── INSTRUMENTATION (logs simples) ───────────────────────────────────────────
+function logEvent(event, payload = {}) {
+  try {
+    console.log(JSON.stringify({ event, ts: new Date().toISOString(), ...payload }));
+  } catch (_) {}
+}
+
 const app = express();
 
 const SUPABASE_URL      = process.env.SUPABASE_URL      || '';
@@ -1498,6 +1511,8 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
     }
     const pipelineContext = await getPipelineStatusContextForOwnerId(ownerUserId);
 
+    const submittedAt = new Date().toISOString();
+
     const payload = {
       user_id: ownerUserId,
       user_name: ownerUserName,
@@ -1515,9 +1530,31 @@ app.post('/api/debriefs', authenticate, async (req, res) => {
       scores,
     };
 
+    if (FEATURE_DEBRIEF_QUALITY) {
+      const quality = computeDebriefQuality({
+        sections,
+        section_notes: sectionNotes,
+        call_date: callDate,
+        submitted_at: submittedAt,
+      });
+      payload.submitted_at = submittedAt;
+      payload.overall_quality_score = quality.overall_quality_score;
+      payload.quality_flags = quality.quality_flags;
+      payload.quality_breakdown = quality.quality_breakdown;
+      payload.validation_status = 'pending';
+      payload.debrief_mode = typeof raw.debrief_mode === 'string' ? raw.debrief_mode : 'full';
+    }
+
     const { data: debrief, error } = await supabase.from('debriefs').insert(payload).select().single();
     if (error) {
       return res.status(500).json({ error:'Erreur création', detail:error.message || '' });
+    }
+
+    if (debrief) {
+      logEvent('debrief_submitted', { debrief_id: debrief.id, user_id: ownerUserId, mode: payload.debrief_mode });
+      if (FEATURE_DEBRIEF_QUALITY) {
+        logEvent('debrief_quality_scored', { debrief_id: debrief.id, score: payload.overall_quality_score, flags: payload.quality_flags });
+      }
     }
 
     let linkedExistingDeal = false;
@@ -1603,6 +1640,18 @@ app.patch('/api/debriefs/:id', authenticate, async (req, res) => {
       percentage: totals.percentage,
       scores: sectionScores,
     };
+
+    if (FEATURE_DEBRIEF_QUALITY) {
+      const quality = computeDebriefQuality({
+        sections: nextSections,
+        section_notes: nextSectionNotes,
+        call_date: nextCallDate,
+        submitted_at: existing.submitted_at || existing.created_at || new Date().toISOString(),
+      });
+      updateData.overall_quality_score = quality.overall_quality_score;
+      updateData.quality_flags = quality.quality_flags;
+      updateData.quality_breakdown = quality.quality_breakdown;
+    }
 
     const { data: updated, error: updateError } = await supabase
       .from('debriefs')
@@ -3425,5 +3474,174 @@ Fais une synthèse ciblée en suivant STRICTEMENT le format demandé.`;
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status:'ok', version:'21' }));
+// ─── DEBRIEF QUALITY: REVIEW ENDPOINTS ───────────────────────────────────────
+app.post('/api/debriefs/:id/review', authenticate, requireHOS, async (req, res) => {
+  try {
+    if (!FEATURE_DEBRIEF_QUALITY) return res.status(404).json({ error:'Feature désactivée' });
+    const { status, review_note } = req.body || {};
+    if (!['validated', 'corrected', 'rejected'].includes(status)) {
+      return res.status(400).json({ error:'status invalide' });
+    }
+    const { data: debrief } = await supabase.from('debriefs').select('id,user_id,quality_flags').eq('id', req.params.id).single();
+    if (!debrief) return res.status(404).json({ error:'Debrief introuvable' });
+    const canAccess = await canUserAccessOwnerData(req.user, debrief.user_id);
+    if (!canAccess) return res.status(403).json({ error:'Accès refusé' });
+
+    const note = typeof review_note === 'string' ? review_note.slice(0, 2000) : null;
+    const { data: review, error: revErr } = await supabase
+      .from('debrief_reviews')
+      .insert({ debrief_id: debrief.id, reviewer_id: req.user.id, status, review_note: note })
+      .select()
+      .single();
+    if (revErr) return res.status(500).json({ error:'Erreur création review', detail: revErr.message || '' });
+
+    const flags = Array.isArray(debrief.quality_flags) ? [...debrief.quality_flags] : [];
+    if (status === 'corrected' && !flags.includes('manager_corrected')) flags.push('manager_corrected');
+
+    await supabase.from('debriefs').update({
+      validation_status: status,
+      validated_at: new Date().toISOString(),
+      validated_by: req.user.id,
+      quality_flags: flags,
+    }).eq('id', debrief.id);
+
+    logEvent('debrief_reviewed', { debrief_id: debrief.id, reviewer_id: req.user.id, status });
+    res.status(201).json({ review });
+  } catch (err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
+});
+
+app.get('/api/manager/review-queue', authenticate, requireHOS, async (req, res) => {
+  try {
+    if (!FEATURE_DEBRIEF_QUALITY) return res.json([]);
+    let scopeIds = null;
+    if (!isAdminRole(req.user.role)) {
+      const memberIds = await getHOSTeamMemberIds(req.user.id);
+      scopeIds = [...new Set([req.user.id, ...memberIds])];
+    }
+    let query = supabase
+      .from('debriefs')
+      .select('id,user_id,user_name,prospect_name,call_date,submitted_at,overall_quality_score,quality_flags,validation_status')
+      .eq('validation_status', 'pending')
+      .order('overall_quality_score', { ascending: true })
+      .limit(50);
+    if (scopeIds) query = query.in('user_id', scopeIds);
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error:'Erreur récupération' });
+    const items = (data || []).filter(d =>
+      (typeof d.overall_quality_score === 'number' && d.overall_quality_score < 70) ||
+      (Array.isArray(d.quality_flags) && d.quality_flags.length > 0)
+    );
+    res.json(items);
+  } catch (err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
+});
+
+// ─── MANAGER COCKPIT: DECISION FEED v1 (déterministe) ────────────────────────
+app.get('/api/manager/decision-feed', authenticate, requireHOS, async (req, res) => {
+  try {
+    if (!FEATURE_MANAGER_COCKPIT) return res.status(404).json({ error:'Feature désactivée' });
+    let scopeIds;
+    if (isAdminRole(req.user.role)) {
+      const { data: users } = await supabase.from('users').select('id,name');
+      scopeIds = (users || []).map(u => u.id);
+    } else {
+      const memberIds = await getHOSTeamMemberIds(req.user.id);
+      scopeIds = [...new Set([req.user.id, ...memberIds])];
+    }
+    if (!scopeIds.length) return res.json({ coach_queue: [], drop_alerts: [], skill_gaps: [], one_on_one_briefs: [] });
+
+    const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    const { data: debriefs } = await supabase
+      .from('debriefs')
+      .select('id,user_id,user_name,call_date,percentage,scores,overall_quality_score,quality_flags')
+      .in('user_id', scopeIds)
+      .gte('call_date', since)
+      .order('call_date', { ascending: false });
+
+    const byCloser = new Map();
+    for (const d of debriefs || []) {
+      if (!byCloser.has(d.user_id)) byCloser.set(d.user_id, { user_id: d.user_id, user_name: d.user_name, items: [] });
+      byCloser.get(d.user_id).items.push(d);
+    }
+
+    const SKILL_KEYS = ['decouverte', 'reformulation', 'projection', 'presentation_offre', 'closing'];
+    const teamAvgPct = (() => {
+      const all = (debriefs || []).map(d => d.percentage || 0).filter(Boolean);
+      return all.length ? all.reduce((a, b) => a + b, 0) / all.length : 0;
+    })();
+
+    const coach_queue = [];
+    const drop_alerts = [];
+    const skill_gaps = [];
+    const one_on_one_briefs = [];
+
+    for (const closer of byCloser.values()) {
+      const items = closer.items;
+      if (items.length === 0) continue;
+      const avg = items.reduce((s, d) => s + (d.percentage || 0), 0) / items.length;
+      const recent = items.slice(0, 3);
+      const older = items.slice(3, 8);
+      const recentAvg = recent.reduce((s, d) => s + (d.percentage || 0), 0) / recent.length;
+      const olderAvg = older.length ? older.reduce((s, d) => s + (d.percentage || 0), 0) / older.length : recentAvg;
+      const dataConfidence = items.length >= 5 ? 'high' : items.length >= 2 ? 'medium' : 'low';
+
+      const reasons = [];
+      let priority = 0;
+      if (avg < teamAvgPct - 10) { priority += 30; reasons.push(`moyenne ${Math.round(avg)}% < équipe ${Math.round(teamAvgPct)}%`); }
+      if (recentAvg < olderAvg - 10) { priority += 25; reasons.push(`baisse récente: ${Math.round(olderAvg)}% → ${Math.round(recentAvg)}%`); }
+      const lowQuality = items.filter(d => (d.overall_quality_score || 100) < 60).length;
+      if (lowQuality >= 2) { priority += 15; reasons.push(`${lowQuality} debriefs à faible qualité`); }
+      if (items.length < 3) { priority += 10; reasons.push('peu de debriefs (fraîcheur faible)'); }
+
+      const skillAverages = {};
+      for (const k of SKILL_KEYS) {
+        const vals = items.map(d => d.scores?.[k]).filter(v => typeof v === 'number');
+        if (vals.length) skillAverages[k] = vals.reduce((a, b) => a + b, 0) / vals.length;
+      }
+      const weakest = Object.entries(skillAverages).sort((a, b) => a[1] - b[1])[0];
+      if (weakest && weakest[1] < 3) {
+        priority += 10;
+        reasons.push(`${weakest[0]} faible (${weakest[1].toFixed(1)}/5)`);
+        skill_gaps.push({ user_id: closer.user_id, user_name: closer.user_name, skill: weakest[0], score: Number(weakest[1].toFixed(1)) });
+      }
+
+      if (priority > 0) {
+        coach_queue.push({
+          user_id: closer.user_id,
+          user_name: closer.user_name,
+          priority_score: priority,
+          avg_percentage: Math.round(avg),
+          recent_avg: Math.round(recentAvg),
+          debriefs_count: items.length,
+          data_confidence: dataConfidence,
+          reasons,
+        });
+      }
+      if (recentAvg < olderAvg - 15 && older.length >= 2) {
+        drop_alerts.push({
+          user_id: closer.user_id,
+          user_name: closer.user_name,
+          delta: Math.round(recentAvg - olderAvg),
+          data_confidence: dataConfidence,
+        });
+      }
+      one_on_one_briefs.push({
+        user_id: closer.user_id,
+        user_name: closer.user_name,
+        avg_percentage: Math.round(avg),
+        weakest_skill: weakest ? weakest[0] : null,
+        debriefs_count: items.length,
+        last_call: items[0]?.call_date || null,
+      });
+    }
+
+    coach_queue.sort((a, b) => b.priority_score - a.priority_score);
+    drop_alerts.sort((a, b) => a.delta - b.delta);
+    skill_gaps.sort((a, b) => a.score - b.score);
+
+    logEvent('manager_cockpit_opened', { user_id: req.user.id, scope_size: scopeIds.length });
+    res.json({ coach_queue, drop_alerts, skill_gaps, one_on_one_briefs });
+  } catch (err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
+});
+
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'22', features: { debrief_quality: FEATURE_DEBRIEF_QUALITY, manager_cockpit: FEATURE_MANAGER_COCKPIT } }));
 app.listen(PORT, () => console.log("CloserDebrief API v21 - port " + PORT));
