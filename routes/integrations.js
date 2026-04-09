@@ -31,6 +31,54 @@ function buildOAuth2WithTokens(integration) {
   return { oauth2, accessToken, refreshToken };
 }
 
+function isoStartValue(startDate) {
+  if (!startDate) return null;
+  const parsed = new Date(startDate);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function followUpDateValue(startDate) {
+  if (!startDate) return null;
+  const iso = String(startDate);
+  return iso.includes('T') ? iso.split('T')[0] : iso;
+}
+
+function buildCalendarNotes({ eventTitle, attendees, prospectEmail, description }) {
+  return [
+    'Source : Google Agenda',
+    `Événement : ${eventTitle}`,
+    prospectEmail ? `Email : ${prospectEmail}` : '',
+    (attendees || []).length > 1 ? `Participants : ${(attendees || []).map(a => a.email).filter(Boolean).join(', ')}` : '',
+    description ? `Description : ${String(description).slice(0, 300)}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+async function ensureCalendarLeadLink({ supabase, userId, eventId, dealId }) {
+  const { data: existingLink } = await supabase
+    .from('calendar_leads')
+    .select('id,deal_id')
+    .eq('user_id', userId)
+    .eq('google_event_id', eventId)
+    .maybeSingle();
+
+  if (existingLink?.id) {
+    if (dealId && !existingLink.deal_id) {
+      await supabase
+        .from('calendar_leads')
+        .update({ deal_id: dealId })
+        .eq('id', existingLink.id);
+    }
+    return existingLink;
+  }
+
+  await supabase.from('calendar_leads').insert({
+    user_id: userId,
+    google_event_id: eventId,
+    deal_id: dealId || null,
+  }).catch(() => {});
+  return null;
+}
+
 async function subscribeCalendarWatch(userId, supabase) {
   const { data: integration } = await supabase
     .from('user_integrations')
@@ -260,30 +308,40 @@ module.exports = function registerIntegrationRoutes(app, { authenticate, supabas
       .maybeSingle();
     if (existing) return res.status(409).json({ error: 'Déjà importé' });
 
+    const { data: existingDeal } = await supabase
+      .from('deals')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('google_event_id', eventId)
+      .maybeSingle();
+    if (existingDeal?.id) {
+      await ensureCalendarLeadLink({ supabase, userId: req.user.id, eventId, dealId: existingDeal.id });
+      return res.json({ ok: true, dealId: existingDeal.id, alreadyExisting: true });
+    }
+
     const prospectName = (attendees && attendees[0]?.name) || (attendees && attendees[0]?.email?.split('@')[0]) || title;
-    const notes = [
-      'Source : Google Agenda',
-      `Événement : ${title}`,
-      ...(attendees || []).map(a => `Participant : ${a.name || ''} ${a.email || ''}`.trim()),
-    ].join('\n');
+    const primaryAttendee = (attendees || [])[0] || {};
+    const notes = buildCalendarNotes({
+      eventTitle: title,
+      attendees: attendees || [],
+      prospectEmail: primaryAttendee.email || '',
+      description: '',
+    });
 
     const { data: deal } = await supabase.from('deals').insert({
       user_id:       req.user.id,
+      user_name:     req.user.name,
       prospect_name: prospectName,
       source:        'google_calendar',
       status:        'prospect',
       value:         0,
       notes,
       google_event_id: eventId,
-      scheduled_at: start ? new Date(start).toISOString() : null,
-      follow_up_date: start ? start.split('T')[0] : null,
+      scheduled_at: isoStartValue(start),
+      follow_up_date: followUpDateValue(start),
     }).select('id').single();
 
-    await supabase.from('calendar_leads').insert({
-      user_id:         req.user.id,
-      google_event_id: eventId,
-      deal_id:         deal?.id || null,
-    });
+    await ensureCalendarLeadLink({ supabase, userId: req.user.id, eventId, dealId: deal?.id || null });
 
     res.json({ ok: true, dealId: deal?.id });
   });
@@ -404,7 +462,6 @@ module.exports = function registerIntegrationRoutes(app, { authenticate, supabas
 
       for (const event of events) {
         if (event.status === 'cancelled') continue;
-        if (syncedIds.has(event.id)) continue;
 
         const attendees = (event.attendees || []).filter(a => !a.self);
         if (attendees.length === 0) continue;
@@ -414,42 +471,69 @@ module.exports = function registerIntegrationRoutes(app, { authenticate, supabas
         const prospectEmail = prospect.email || '';
         const startDate     = event.start?.dateTime || event.start?.date;
         const eventTitle    = event.summary || 'Rendez-vous';
-        const notes = [
-          'Source : Google Agenda',
-          `Événement : ${eventTitle}`,
-          prospectEmail ? `Email : ${prospectEmail}` : '',
-          attendees.length > 1 ? `Participants : ${attendees.map(a => a.email).join(', ')}` : '',
-          event.description ? `Description : ${event.description.slice(0, 300)}` : '',
-        ].filter(Boolean).join('\n');
-
-        const { data: deal } = await supabase.from('deals').insert({
-          user_id:        integration.user_id,
-          prospect_name:  prospectName,
-          source:         'google_calendar',
-          status:         'prospect',
-          value:          0,
-          notes,
-          google_event_id: event.id,
-          scheduled_at: startDate ? new Date(startDate).toISOString() : null,
-          follow_up_date: startDate ? startDate.split('T')[0] : null,
-        }).select('id').single();
-
-        await supabase.from('calendar_leads').insert({
-          user_id:         integration.user_id,
-          google_event_id: event.id,
-          deal_id:         deal?.id || null,
+        const notes = buildCalendarNotes({
+          eventTitle,
+          attendees,
+          prospectEmail,
+          description: event.description || '',
         });
 
-        // In-app notification
-        await supabase.from('notifications').insert({
-          user_id: integration.user_id,
-          type: 'gcal_lead',
-          title: `Nouveau RDV importé : ${eventTitle}`,
-          body: startDate
-            ? `${prospectName} — ${new Date(startDate).toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`
-            : prospectName,
-          data: { dealId: deal?.id || null, eventId: event.id },
+        const { data: existingDeal } = await supabase
+          .from('deals')
+          .select('id,status')
+          .eq('user_id', integration.user_id)
+          .eq('google_event_id', event.id)
+          .maybeSingle();
+
+        let dealId = existingDeal?.id || null;
+        let created = false;
+        if (dealId) {
+          await supabase.from('deals')
+            .update({
+              prospect_name: prospectName,
+              notes,
+              scheduled_at: isoStartValue(startDate),
+              follow_up_date: followUpDateValue(startDate),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', dealId);
+        } else {
+          const { data: deal } = await supabase.from('deals').insert({
+            user_id: integration.user_id,
+            prospect_name: prospectName,
+            source: 'google_calendar',
+            status: 'prospect',
+            value: 0,
+            notes,
+            google_event_id: event.id,
+            scheduled_at: isoStartValue(startDate),
+            follow_up_date: followUpDateValue(startDate),
+          }).select('id').single();
+          dealId = deal?.id || null;
+          created = !!dealId;
+        }
+
+        await ensureCalendarLeadLink({
+          supabase,
+          userId: integration.user_id,
+          eventId: event.id,
+          dealId,
         });
+
+        if (created || !syncedIds.has(event.id)) {
+          // In-app notification
+          await supabase.from('notifications').insert({
+            user_id: integration.user_id,
+            type: 'gcal_lead',
+            title: `Nouveau RDV importé : ${eventTitle}`,
+            body: startDate
+              ? `${prospectName} — ${new Date(startDate).toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`
+              : prospectName,
+            data: { dealId: dealId || null, eventId: event.id },
+          });
+        }
+
+        syncedIds.add(event.id);
       }
     } catch (_) {
       // Silent — webhook errors should not crash the server
@@ -535,8 +619,6 @@ async function syncCalendarForUser(userId, supabase) {
   let leadsCreated = 0;
 
   for (const event of events) {
-    if (syncedIds.has(event.id)) continue;
-
     const attendees = (event.attendees || []).filter(a => !a.self);
     if (attendees.length === 0) continue;
 
@@ -545,48 +627,68 @@ async function syncCalendarForUser(userId, supabase) {
     const prospectEmail = prospect.email || '';
     const startDate     = event.start?.dateTime || event.start?.date;
     const eventTitle    = event.summary || 'Rendez-vous';
-    const notes = [
-      'Source : Google Agenda',
-      `Événement : ${eventTitle}`,
-      prospectEmail ? `Email : ${prospectEmail}` : '',
-      attendees.length > 1 ? `Participants : ${attendees.map(a => a.email).join(', ')}` : '',
-      event.description ? `Description : ${event.description.slice(0, 300)}` : '',
-    ].filter(Boolean).join('\n');
+    const notes = buildCalendarNotes({
+      eventTitle,
+      attendees,
+      prospectEmail,
+      description: event.description || '',
+    });
 
-    let deal = null;
-    try {
-      const { data: d } = await supabase.from('deals').insert({
-        user_id:        userId,
-        prospect_name:  prospectName,
-        source:         'google_calendar',
-        status:         'prospect',
-        value:          0,
-        notes,
-        google_event_id: event.id,
-        scheduled_at: startDate ? new Date(startDate).toISOString() : null,
-        follow_up_date: startDate ? startDate.split('T')[0] : null,
-      }).select('id').single();
-      deal = d;
-    } catch (_) {
-      // Fallback: insert without new columns (migration not yet run)
-      const { data: d } = await supabase.from('deals').insert({
-        user_id:        userId,
-        prospect_name:  prospectName,
-        status:         'prospect',
-        value:          0,
-        notes,
-        follow_up_date: startDate ? startDate.split('T')[0] : null,
-      }).select('id').single();
-      deal = d;
+    const { data: existingDeal } = await supabase
+      .from('deals')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('google_event_id', event.id)
+      .maybeSingle();
+
+    let deal = existingDeal || null;
+    if (deal?.id) {
+      await supabase.from('deals')
+        .update({
+          prospect_name: prospectName,
+          notes,
+          scheduled_at: isoStartValue(startDate),
+          follow_up_date: followUpDateValue(startDate),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', deal.id)
+        .catch(() => {});
+    } else {
+      try {
+        const { data: d } = await supabase.from('deals').insert({
+          user_id:        userId,
+          prospect_name:  prospectName,
+          source:         'google_calendar',
+          status:         'prospect',
+          value:          0,
+          notes,
+          google_event_id: event.id,
+          scheduled_at: isoStartValue(startDate),
+          follow_up_date: followUpDateValue(startDate),
+        }).select('id').single();
+        deal = d;
+      } catch (_) {
+        // Fallback: insert without new columns (migration not yet run)
+        const { data: d } = await supabase.from('deals').insert({
+          user_id:        userId,
+          prospect_name:  prospectName,
+          status:         'prospect',
+          value:          0,
+          notes,
+          follow_up_date: followUpDateValue(startDate),
+        }).select('id').single();
+        deal = d;
+      }
+      if (deal?.id) leadsCreated++;
     }
 
-    await supabase.from('calendar_leads').insert({
-      user_id:         userId,
-      google_event_id: event.id,
-      deal_id:         deal?.id || null,
-    }).catch(() => {});
-
-    leadsCreated++;
+    await ensureCalendarLeadLink({
+      supabase,
+      userId,
+      eventId: event.id,
+      dealId: deal?.id || null,
+    });
+    syncedIds.add(event.id);
   }
 
   await supabase.from('user_integrations')

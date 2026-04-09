@@ -831,6 +831,30 @@ function sanitizeContactDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
 }
 
+function isPastDateOnly(value) {
+  const dateValue = sanitizeContactDate(value);
+  if (!dateValue) return false;
+  const target = new Date(`${dateValue}T00:00:00`);
+  if (Number.isNaN(target.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return target.getTime() < today.getTime();
+}
+
+async function createUserNotification({ userId, type, title, body = '', data = null }) {
+  if (!userId || !title) return;
+  await supabase
+    .from('notifications')
+    .insert({
+      user_id: userId,
+      type: type || 'info',
+      title,
+      body,
+      data: data && typeof data === 'object' ? data : null,
+    })
+    .catch(() => {});
+}
+
 function parseDealNotes(rawNotes) {
   const raw = typeof rawNotes === 'string' ? rawNotes : '';
   if (!raw.startsWith(CONTACT_META_PREFIX)) {
@@ -1312,7 +1336,30 @@ require('./routes/auth')(app, {
   validatePasswordPolicy,
   getLoginState, registerLoginFailure, clearLoginFailures,
 });
-require('./routes/debriefs')(app, { authenticate, requireHOS, requireAdmin, validateSections, canUserAccessOwnerData, buildGamification, invalidateGamCache, recordSecurityAudit, attachEffectiveRole, isAdminRole, isManagerRole, debriefQuality: require('./lib/debriefQuality'), FEATURE_DEBRIEF_QUALITY, FEATURE_MANAGER_COCKPIT });
+require('./routes/debriefs')(app, {
+  authenticate,
+  requireHOS,
+  requireAdmin,
+  validateSections,
+  canUserAccessOwnerData,
+  buildGamification,
+  invalidateGamCache,
+  recordSecurityAudit,
+  attachEffectiveRole,
+  isAdminRole,
+  isManagerRole,
+  debriefQuality: require('./lib/debriefQuality'),
+  FEATURE_DEBRIEF_QUALITY,
+  FEATURE_MANAGER_COCKPIT,
+  getHOSTeamMemberIds,
+  computeDebriefTotals,
+  computeSectionScores,
+  sanitizeContactText,
+  sanitizeContactDate,
+  getUserWithEffectiveRole,
+  getPipelineStatusContextForOwnerId,
+  logEvent,
+});
 // ─── GAMIFICATION ─────────────────────────────────────────────────────────────
 app.get('/api/gamification/me', authenticate, async (req, res) => { res.json(await buildGamification(req.user.id)); });
 app.get('/api/gamification/leaderboard', authenticate, async (req, res) => {
@@ -1440,6 +1487,35 @@ app.post('/api/objectives', authenticate, requireHOS, async (req, res) => {
         .single();
       result = data;
     }
+
+    const { data: closerUser } = await supabase
+      .from('users')
+      .select('id,name,email')
+      .eq('id', closer_id)
+      .maybeSingle();
+
+    await createUserNotification({
+      userId: closer_id,
+      type: 'objective_assigned',
+      title: `Objectif ${period_type === 'weekly' ? 'hebdomadaire' : 'mensuel'} mis à jour`,
+      body: `Réécoutes: ${normalizedTargets.target_debriefs} • Perf: ${normalizedTargets.target_score}% • Closings: ${normalizedTargets.target_closings} • CA: ${normalizedTargets.target_revenue}€`,
+      data: { objectiveId: result?.id || null, periodType: period_type, periodStart: period_start },
+    });
+
+    if (closerUser?.email) {
+      await emailService.sendObjectiveAssigned({
+        to: closerUser.email,
+        name: closerUser.name || 'Closer',
+        periodType: period_type,
+        targets: {
+          reecoutes: normalizedTargets.target_debriefs,
+          performance: normalizedTargets.target_score,
+          closings: normalizedTargets.target_closings,
+          revenue: normalizedTargets.target_revenue,
+        },
+      });
+    }
+
     res.json(mapObjectiveAliases(result));
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
@@ -1521,10 +1597,13 @@ app.delete('/api/action-plans/:id', authenticate, requireHOS, async (req, res) =
 app.get('/api/deals', authenticate, async (req, res) => {
   try {
     const { page, limit, offset } = parsePagination(req.query);
+    const wantsMeta = req.query?.meta === '1' || req.query?.paginated === '1';
     if (isAdminRole(req.user.role)) {
       const { data, error, count } = await supabase.from('deals').select('*', { count: 'exact' }).order('updated_at', { ascending:false }).range(offset, offset + limit - 1);
       if (error) return res.status(500).json({ error:'Erreur récupération' });
-      return res.json({ data: (data || []).map(mapDealForClient), meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
+      const mapped = (data || []).map(mapDealForClient);
+      if (!wantsMeta) return res.json(mapped);
+      return res.json({ data: mapped, meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
     }
     let ids = [req.user.id];
     if (normalizeRole(req.user.role) === 'head_of_sales') {
@@ -1533,7 +1612,9 @@ app.get('/api/deals', authenticate, async (req, res) => {
     }
     const { data, error, count } = await supabase.from('deals').select('*', { count: 'exact' }).in('user_id', ids).order('updated_at', { ascending:false }).range(offset, offset + limit - 1);
     if (error) return res.status(500).json({ error:'Erreur récupération' });
-    res.json({ data: (data || []).map(mapDealForClient), meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
+    const mapped = (data || []).map(mapDealForClient);
+    if (!wantsMeta) return res.json(mapped);
+    res.json({ data: mapped, meta: { total: count || 0, page, pages: Math.ceil((count || 0) / limit), limit } });
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
 
@@ -1569,7 +1650,47 @@ app.post('/api/deals', authenticate, async (req, res) => {
     .select()
     .single();
   if (error) return res.status(500).json({ error:'Erreur création' });
-  res.status(201).json(mapDealForClient(data));
+  const createdDeal = mapDealForClient(data);
+
+  const isClosed = pipelineContext.closedKeys.has(status || '');
+  const userEmail = req.user.email || null;
+  const userName = req.user.name || 'Closer';
+  if (!isClosed && isPastDateOnly(follow_up_date)) {
+    await createUserNotification({
+      userId: req.user.id,
+      type: 'follow_up_risk',
+      title: `Relance à risque : ${prospect_name}`,
+      body: `Date de relance dépassée (${follow_up_date})`,
+      data: { dealId: data?.id || null },
+    });
+    if (userEmail) {
+      await emailService.sendRiskFollowUpReminder({
+        to: userEmail,
+        name: userName,
+        leadName: prospect_name,
+        followUpDate: follow_up_date,
+      });
+    }
+  }
+
+  if (!payload.debrief_id && source !== 'debrief' && source !== 'google_calendar') {
+    await createUserNotification({
+      userId: req.user.id,
+      type: 'debrief_reminder',
+      title: `Rappel debrief : ${prospect_name}`,
+      body: 'Pensez à renseigner le debrief associé à ce lead.',
+      data: { dealId: data?.id || null },
+    });
+    if (userEmail) {
+      await emailService.sendDebriefReminder({
+        to: userEmail,
+        name: userName,
+        leadName: prospect_name,
+      });
+    }
+  }
+
+  res.status(201).json(createdDeal);
 });
 
 app.patch('/api/deals/:id', authenticate, async (req, res) => {
@@ -1603,6 +1724,7 @@ app.patch('/api/deals/:id', authenticate, async (req, res) => {
       : (currentStatus || pipelineContext.openKey));
     const note = payload.note ?? payload.notes ?? previous.note ?? '';
     const follow_up_date = sanitizeContactDate(payload.contact_date || payload.follow_up_date || nextMeta.contact_date || deal.follow_up_date) || null;
+    const wasOverdue = !pipelineContext.closedKeys.has(currentStatus) && isPastDateOnly(deal.follow_up_date);
 
     const updateData = {
       prospect_name,
@@ -1624,6 +1746,29 @@ app.patch('/api/deals/:id', authenticate, async (req, res) => {
       .select()
       .single();
     if (error) return res.status(500).json({ error:'Erreur mise à jour' });
+
+    const nowOverdue = !pipelineContext.closedKeys.has(status || '') && isPastDateOnly(follow_up_date);
+    if (nowOverdue && !wasOverdue) {
+      await createUserNotification({
+        userId: deal.user_id,
+        type: 'follow_up_risk',
+        title: `Relance à risque : ${prospect_name}`,
+        body: `Date de relance dépassée (${follow_up_date})`,
+        data: { dealId: deal.id },
+      });
+      const recipientEmail = req.user.id === deal.user_id
+        ? (req.user.email || null)
+        : (await supabase.from('users').select('email').eq('id', deal.user_id).maybeSingle())?.data?.email;
+      if (recipientEmail) {
+        await emailService.sendRiskFollowUpReminder({
+          to: recipientEmail,
+          name: deal.user_name || req.user.name || 'Closer',
+          leadName: prospect_name,
+          followUpDate: follow_up_date,
+        });
+      }
+    }
+
     res.json(mapDealForClient(data));
   } catch(err) { console.error(err); res.status(500).json({ error:'Erreur serveur' }); }
 });
@@ -1677,18 +1822,15 @@ app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res
     const rowsByLegacy = [];
     if (hasLegacyRequest || rawProfileKey.includes('zapier') || rawProfileKey.includes('test')) {
       const [
-        sourceLegacy,
         sourceZapier,
         userZapier,
         userTest,
       ] = await Promise.all([
-        supabase.from('deals').select('id,user_id,user_name,source').ilike('source', '%iclosed%'),
         supabase.from('deals').select('id,user_id,user_name,source').ilike('source', '%zapier%'),
         supabase.from('deals').select('id,user_id,user_name,source').ilike('user_name', '%zapier%'),
         supabase.from('deals').select('id,user_id,user_name,source').ilike('user_name', '%test%'),
       ]);
       const errors = [
-        sourceLegacy.error,
         sourceZapier.error,
         userZapier.error,
         userTest.error,
@@ -1697,7 +1839,6 @@ app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res
         return res.status(500).json({ error:'Erreur récupération', detail:errors[0].message || '' });
       }
       rowsByLegacy.push(
-        ...(sourceLegacy.data || []),
         ...(sourceZapier.data || []),
         ...(userZapier.data || []),
         ...(userTest.data || []),

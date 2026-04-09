@@ -91,10 +91,19 @@ describe('Pagination GET /api/debriefs', () => {
 });
 
 describe('Pagination GET /api/deals', () => {
-  it('retourne { data, meta } avec page/limit', async () => {
+  it('retourne un tableau par défaut (compat legacy)', async () => {
     global.__debriefsMock = { data: [], count: 0 };
     const res = await request(app)
       .get('/api/deals?page=1&limit=5')
+      .set('Authorization', `Bearer ${makeToken()}`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+  });
+
+  it('retourne { data, meta } si meta=1', async () => {
+    global.__debriefsMock = { data: [], count: 0 };
+    const res = await request(app)
+      .get('/api/deals?page=1&limit=5&meta=1')
       .set('Authorization', `Bearer ${makeToken()}`);
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('data');

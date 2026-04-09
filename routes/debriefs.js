@@ -1,5 +1,13 @@
 'use strict';
 const supabase = require('../lib/supabase');
+
+function fallbackDebriefQuality() {
+  return {
+    overall_quality_score: 0,
+    quality_flags: [],
+    quality_breakdown: {},
+  };
+}
 function normalizeRole(role) {
   const normalized = String(role || '').trim().toLowerCase();
   if (normalized === 'admin') return 'admin';
@@ -15,7 +23,31 @@ function parsePagination(query) {
 }
 
 
-module.exports = function register(app, { authenticate, requireHOS, requireAdmin, validateSections, canUserAccessOwnerData, buildGamification, invalidateGamCache, recordSecurityAudit, attachEffectiveRole, isAdminRole, isManagerRole, debriefQuality, FEATURE_DEBRIEF_QUALITY, FEATURE_MANAGER_COCKPIT }) {
+module.exports = function register(app, {
+  authenticate,
+  requireHOS,
+  requireAdmin,
+  validateSections,
+  canUserAccessOwnerData,
+  buildGamification,
+  invalidateGamCache,
+  recordSecurityAudit,
+  attachEffectiveRole,
+  isAdminRole,
+  isManagerRole,
+  debriefQuality,
+  FEATURE_DEBRIEF_QUALITY,
+  FEATURE_MANAGER_COCKPIT,
+  getHOSTeamMemberIds,
+  computeDebriefTotals,
+  computeSectionScores,
+  sanitizeContactText,
+  sanitizeContactDate,
+  getUserWithEffectiveRole,
+  getPipelineStatusContextForOwnerId,
+  logEvent,
+}) {
+  const computeDebriefQuality = debriefQuality?.computeDebriefQuality || fallbackDebriefQuality;
 
   // ─── DEBRIEFS ─────────────────────────────────────────────────────────────────
   app.get('/api/debriefs', authenticate, async (req, res) => {
