@@ -250,9 +250,9 @@ async function syncCalendarForUser(userId, supabase) {
   for (const event of events) {
     if (syncedIds.has(event.id)) continue;
 
-    // Import events that have at least one other participant (not just the user)
+    // Import events with at least one other participant (skip personal/solo events)
     const attendees = (event.attendees || []).filter(a => !a.self);
-    if (attendees.length === 0 && (event.attendees || []).length > 0) continue; // skip solo blocks
+    if (attendees.length === 0) continue;
 
     // Build prospect info from first external attendee
     const prospect = attendees[0];
