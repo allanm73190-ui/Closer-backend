@@ -89,6 +89,9 @@ if (IS_PROD && (!SUPABASE_URL || !SUPABASE_KEY)) {
 if (IS_PROD && JWT_SECRET.length < 32) {
   console.warn('JWT_SECRET recommandé: 32+ caractères (longueur actuelle: %s).', JWT_SECRET.length);
 }
+if (IS_PROD && !process.env.TOKEN_ENCRYPTION_KEY) {
+  console.warn('TOKEN_ENCRYPTION_KEY manquant en production — les tokens Google ne seront pas chiffrés.');
+}
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -2454,6 +2457,10 @@ if (GOOGLE_CLIENT_ID) {
   setInterval(runGlobalSync, SYNC_INTERVAL);
   // First run after 2 minutes on boot
   setTimeout(runGlobalSync, 2 * 60 * 1000);
+
+  // Watch channel renewal — check every hour, renew if expiring within 24h
+  const { startRenewalCron } = require('./lib/calendarWatchRenewal');
+  startRenewalCron(supabase);
 }
 
 app.get('/api/health', (req, res) => res.json({ status:'ok', version:'23', features: { debrief_quality: FEATURE_DEBRIEF_QUALITY, manager_cockpit: FEATURE_MANAGER_COCKPIT, google_calendar: !!GOOGLE_CLIENT_ID } }));
