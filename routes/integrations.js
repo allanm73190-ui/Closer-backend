@@ -139,29 +139,33 @@ module.exports = function registerIntegrationRoutes(app, { authenticate, supabas
 
   // ── GET /api/integrations/google/status ─────────────────────────────────────
   app.get('/api/integrations/google/status', authenticate, async (req, res) => {
-    const { data } = await supabase
-      .from('user_integrations')
-      .select('google_refresh_token, google_refresh_token_enc, gcal_sync_enabled, gcal_last_synced_at, gcal_watch_active, gcal_channel_expires_at')
-      .eq('user_id', req.user.id)
-      .maybeSingle();
-    const hasRefresh = !!(
-      (data?.google_refresh_token_enc && decrypt(data.google_refresh_token_enc)) ||
-      data?.google_refresh_token
-    );
-    res.json({
-      connected: hasRefresh,
-      syncEnabled: data?.gcal_sync_enabled ?? false,
-      lastSynced: data?.gcal_last_synced_at ?? null,
-      watchActive: data?.gcal_watch_active ?? false,
-      channelExpiresAt: data?.gcal_channel_expires_at ?? null,
-    });
+    try {
+      const { data } = await supabase
+        .from('user_integrations')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      const hasRefresh = !!(
+        (data?.google_refresh_token_enc && decrypt(data.google_refresh_token_enc)) ||
+        data?.google_refresh_token
+      );
+      res.json({
+        connected: hasRefresh,
+        syncEnabled: data?.gcal_sync_enabled ?? false,
+        lastSynced: data?.gcal_last_synced_at ?? null,
+        watchActive: data?.gcal_watch_active ?? false,
+        channelExpiresAt: data?.gcal_channel_expires_at ?? null,
+      });
+    } catch (_) {
+      res.json({ connected: false, syncEnabled: false, lastSynced: null, watchActive: false, channelExpiresAt: null });
+    }
   });
 
   // ── DELETE /api/integrations/google — disconnect ─────────────────────────────
   app.delete('/api/integrations/google', authenticate, async (req, res) => {
     const { data: integration } = await supabase
       .from('user_integrations')
-      .select('gcal_channel_id, gcal_resource_id, google_access_token, google_access_token_enc, google_refresh_token, google_refresh_token_enc, google_token_expiry')
+      .select('*')
       .eq('user_id', req.user.id)
       .maybeSingle();
 
@@ -454,13 +458,17 @@ module.exports = function registerIntegrationRoutes(app, { authenticate, supabas
 
   // ── GET /api/notifications ───────────────────────────────────────────────────
   app.get('/api/notifications', authenticate, async (req, res) => {
-    const { data } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false })
-      .limit(20);
-    res.json(data || []);
+    try {
+      const { data } = await supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .order('created_at', { ascending: false })
+        .limit(20);
+      res.json(data || []);
+    } catch (_) {
+      res.json([]);
+    }
   });
 
   // NOTE: read-all MUST be declared before :id/read to avoid Express capturing 'read-all' as an :id param
@@ -545,23 +553,38 @@ async function syncCalendarForUser(userId, supabase) {
       event.description ? `Description : ${event.description.slice(0, 300)}` : '',
     ].filter(Boolean).join('\n');
 
-    const { data: deal } = await supabase.from('deals').insert({
-      user_id:        userId,
-      prospect_name:  prospectName,
-      source:         'google_calendar',
-      status:         'prospect',
-      value:          0,
-      notes,
-      google_event_id: event.id,
-      scheduled_at: startDate ? new Date(startDate).toISOString() : null,
-      follow_up_date: startDate ? startDate.split('T')[0] : null,
-    }).select('id').single();
+    let deal = null;
+    try {
+      const { data: d } = await supabase.from('deals').insert({
+        user_id:        userId,
+        prospect_name:  prospectName,
+        source:         'google_calendar',
+        status:         'prospect',
+        value:          0,
+        notes,
+        google_event_id: event.id,
+        scheduled_at: startDate ? new Date(startDate).toISOString() : null,
+        follow_up_date: startDate ? startDate.split('T')[0] : null,
+      }).select('id').single();
+      deal = d;
+    } catch (_) {
+      // Fallback: insert without new columns (migration not yet run)
+      const { data: d } = await supabase.from('deals').insert({
+        user_id:        userId,
+        prospect_name:  prospectName,
+        status:         'prospect',
+        value:          0,
+        notes,
+        follow_up_date: startDate ? startDate.split('T')[0] : null,
+      }).select('id').single();
+      deal = d;
+    }
 
     await supabase.from('calendar_leads').insert({
       user_id:         userId,
       google_event_id: event.id,
       deal_id:         deal?.id || null,
-    });
+    }).catch(() => {});
 
     leadsCreated++;
   }
