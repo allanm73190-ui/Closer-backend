@@ -92,6 +92,106 @@ module.exports = function registerIntegrationRoutes(app, { authenticate, supabas
       res.status(500).json({ error: err.message });
     }
   });
+
+  // ── GET /api/integrations/google/preview — upcoming events (no import) ───────
+  app.get('/api/integrations/google/preview', authenticate, async (req, res) => {
+    try {
+      const { data: integration } = await supabase
+        .from('user_integrations')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+
+      if (!integration?.google_refresh_token) {
+        return res.json({ events: [] });
+      }
+
+      const oauth2 = makeOAuth2Client();
+      oauth2.setCredentials({
+        access_token:  integration.google_access_token,
+        refresh_token: integration.google_refresh_token,
+        expiry_date:   integration.google_token_expiry ? new Date(integration.google_token_expiry).getTime() : null,
+      });
+
+      const calendar = google.calendar({ version: 'v3', auth: oauth2 });
+      const timeMin = new Date().toISOString();
+      const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      const { data: gcalData } = await calendar.events.list({
+        calendarId: integration.google_calendar_id || 'primary',
+        timeMin, timeMax,
+        singleEvents: true,
+        orderBy: 'startTime',
+        maxResults: 30,
+      });
+
+      // Load already-synced event IDs
+      const { data: existing } = await supabase
+        .from('calendar_leads')
+        .select('google_event_id')
+        .eq('user_id', req.user.id);
+      const syncedIds = new Set((existing || []).map(r => r.google_event_id));
+
+      const events = (gcalData.items || [])
+        .filter(e => e.status !== 'cancelled' && e.summary)
+        .map(e => {
+          const attendees = (e.attendees || []).filter(a => !a.self);
+          const startDate = e.start?.dateTime || e.start?.date;
+          return {
+            id:          e.id,
+            title:       e.summary,
+            start:       startDate,
+            attendees:   attendees.map(a => ({ name: a.displayName || '', email: a.email })),
+            alreadySynced: syncedIds.has(e.id),
+          };
+        });
+
+      res.json({ events });
+    } catch (err) {
+      console.error('[GCal preview]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── POST /api/integrations/google/import — import specific event as lead ──────
+  app.post('/api/integrations/google/import', authenticate, async (req, res) => {
+    const { eventId, title, start, attendees } = req.body || {};
+    if (!eventId || !title) return res.status(400).json({ error: 'eventId and title required' });
+
+    // Check not already synced
+    const { data: existing } = await supabase
+      .from('calendar_leads')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('google_event_id', eventId)
+      .maybeSingle();
+    if (existing) return res.status(409).json({ error: 'Déjà importé' });
+
+    const prospectName = (attendees && attendees[0]?.name) || (attendees && attendees[0]?.email?.split('@')[0]) || title;
+    const notes = [
+      'Source : Google Agenda',
+      `Événement : ${title}`,
+      ...(attendees || []).map(a => `Participant : ${a.name || ''} ${a.email || ''}`.trim()),
+    ].join('\n');
+
+    const { data: deal } = await supabase.from('deals').insert({
+      user_id:       req.user.id,
+      prospect_name: prospectName,
+      source:        'google_calendar',
+      status:        'prospect',
+      value:         0,
+      notes,
+      follow_up_date: start ? start.split('T')[0] : null,
+    }).select('id').single();
+
+    await supabase.from('calendar_leads').insert({
+      user_id:         req.user.id,
+      google_event_id: eventId,
+      deal_id:         deal?.id || null,
+    });
+
+    res.json({ ok: true, dealId: deal?.id });
+  });
 };
 
 // ─── Core sync function (also called by background job) ──────────────────────
@@ -150,9 +250,9 @@ async function syncCalendarForUser(userId, supabase) {
   for (const event of events) {
     if (syncedIds.has(event.id)) continue;
 
-    // Only process events where user is the organizer and has external attendees
-    const attendees = (event.attendees || []).filter(a => !a.self && !a.organizer);
-    if (attendees.length === 0) continue;
+    // Import events that have at least one other participant (not just the user)
+    const attendees = (event.attendees || []).filter(a => !a.self);
+    if (attendees.length === 0 && (event.attendees || []).length > 0) continue; // skip solo blocks
 
     // Build prospect info from first external attendee
     const prospect = attendees[0];
