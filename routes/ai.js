@@ -2,7 +2,7 @@
 const supabase = require('../lib/supabase');
 
 // AI routes — registered on the express app instance received via registerAiRoutes()
-module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLimiter, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FALLBACK_MODELS }) {
+module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLimiter, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FALLBACK_MODELS, isAdminRole, getHOSTeamMemberIds, computePatternInsights, toStartOfDay, getDaysSince, canUserAccessOwnerData, computeSectionScores, getDebriefConfigScopeOwnerId, getActiveDebriefConfigSections, getActiveDebriefTemplateCatalog, sanitizePipelineKey, getSectionDataByKey, getSectionNotesByKey, scoreKeyFromSectionKey, formatAnswerFromQuestion, DEFAULT_DEBRIEF_SECTION_CONFIG }) {
 
   // ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
   const AI_SYSTEM_PROMPT = `Tu es un expert senior en analyse d'appels de vente et en coaching commercial, avec 15 ans d'expérience en closing B2B et B2C.

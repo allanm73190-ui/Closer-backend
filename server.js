@@ -1740,7 +1740,7 @@ app.post('/api/deals/purge-profile', authenticate, requireAdmin, async (req, res
 });
 
 // ─── TEAMS (extracted to routes/teams.js) ───────────────────────────────────
-require('./routes/teams')(app, { authenticate, requireHOS, requireAdmin, assertTeamOwner, recordSecurityAudit });
+require('./routes/teams')(app, { authenticate, requireHOS, requireAdmin, assertTeamOwner, recordSecurityAudit, buildMemberStats, generateCode });
 // ─── DEBRIEF CONFIG ───────────────────────────────────────────────────────────
 // GET  /api/debrief-config         — retourne la config active (ou défaut)
 // PUT  /api/debrief-config         — sauvegarde (HOS seulement)
@@ -2170,7 +2170,7 @@ app.get('/api/patterns', authenticate, async (req, res) => {
   }
 });
 // ─── AI ANALYSIS (extracted to routes/ai.js) ────────────────────────────────
-require('./routes/ai')(app, { authenticate, requireHOS, aiLimiter, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FALLBACK_MODELS });
+require('./routes/ai')(app, { authenticate, requireHOS, aiLimiter, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FALLBACK_MODELS, isAdminRole, getHOSTeamMemberIds, computePatternInsights, toStartOfDay, getDaysSince, canUserAccessOwnerData, computeSectionScores, getDebriefConfigScopeOwnerId, getActiveDebriefConfigSections, getActiveDebriefTemplateCatalog, sanitizePipelineKey, getSectionDataByKey, getSectionNotesByKey, scoreKeyFromSectionKey, formatAnswerFromQuestion, DEFAULT_DEBRIEF_SECTION_CONFIG });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 // ─── DEBRIEF QUALITY: REVIEW ENDPOINTS ───────────────────────────────────────

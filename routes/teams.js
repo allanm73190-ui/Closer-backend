@@ -7,7 +7,7 @@ function normalizeRole(role) {
 }
 function isAdminRole(role) { return normalizeRole(role) === 'admin'; }
 
-module.exports = function registerTeamsRoutes(app, { authenticate, requireHOS, requireAdmin, assertTeamOwner, recordSecurityAudit }) {
+module.exports = function registerTeamsRoutes(app, { authenticate, requireHOS, requireAdmin, assertTeamOwner, recordSecurityAudit, buildMemberStats, generateCode }) {
 
   // ─── TEAMS ────────────────────────────────────────────────────────────────────
   app.get('/api/teams/me', authenticate, async (req, res) => {
