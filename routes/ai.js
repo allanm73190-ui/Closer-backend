@@ -3,6 +3,13 @@ const supabase = require('../lib/supabase');
 
 // AI routes — registered on the express app instance received via registerAiRoutes()
 module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLimiter, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FALLBACK_MODELS, isAdminRole, getHOSTeamMemberIds, computePatternInsights, toStartOfDay, getDaysSince, canUserAccessOwnerData, computeSectionScores, getDebriefConfigScopeOwnerId, getActiveDebriefConfigSections, getActiveDebriefTemplateCatalog, sanitizePipelineKey, getSectionDataByKey, getSectionNotesByKey, scoreKeyFromSectionKey, formatAnswerFromQuestion, DEFAULT_DEBRIEF_SECTION_CONFIG }) {
+  function normalizeRoleSafe(role) {
+    const value = String(role || '').trim().toLowerCase();
+    if (value === 'hos') return 'head_of_sales';
+    if (value === 'head_of_sales') return 'head_of_sales';
+    if (value === 'admin') return 'admin';
+    return 'closer';
+  }
 
   // ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
   const AI_SYSTEM_PROMPT = `Tu es un expert senior en analyse d'appels de vente et en coaching commercial, avec 15 ans d'expérience en closing B2B et B2C.
@@ -291,9 +298,12 @@ module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLi
     try {
       let memberIds = [];
       if (isAdminRole(req.user.role)) {
-        const { data: users } = await supabase.from('users').select('id,role');
+        const { data: users, error: usersError } = await supabase.from('users').select('id,role');
+        if (usersError) {
+          return res.status(500).json({ error: 'Erreur récupération utilisateurs manager' });
+        }
         memberIds = (users || [])
-          .filter(user => normalizeRole(user.role) === 'closer')
+          .filter(user => normalizeRoleSafe(user.role) === 'closer')
           .map(user => user.id);
       } else {
         memberIds = await getHOSTeamMemberIds(req.user.id);
