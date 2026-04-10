@@ -330,23 +330,30 @@ module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLi
           .limit(1600),
         supabase
           .from('deals')
-          .select('id,user_id,status,follow_up_date,updated_at,created_at')
+          .select('id,user_id,status,follow_up_date,created_at')
           .in('user_id', memberIds)
-          .order('updated_at', { ascending: false })
+          .order('created_at', { ascending: false })
           .limit(1600),
         supabase
           .from('users')
           .select('id,name')
           .in('id', memberIds),
       ]);
-  
-      if (debriefRes.error || dealsRes.error) {
-        return res.status(500).json({ error: 'Erreur récupération données manager' });
+
+      if (debriefRes.error) {
+        console.error('Manager summary debriefs query error:', debriefRes.error);
+        return res.status(500).json({ error: 'Erreur récupération debriefs manager' });
       }
-  
+      if (dealsRes.error) {
+        console.warn('Manager summary deals query warning (continuing with empty deals):', dealsRes.error);
+      }
+      if (usersRes.error) {
+        console.warn('Manager summary users query warning (continuing with fallback names):', usersRes.error);
+      }
+
       const debriefs = debriefRes.data || [];
-      const deals = dealsRes.data || [];
-      const users = usersRes.data || [];
+      const deals = dealsRes.error ? [] : (dealsRes.data || []);
+      const users = usersRes.error ? [] : (usersRes.data || []);
   
       const today = toStartOfDay(new Date());
       const currentFrom = new Date(today);
@@ -384,7 +391,7 @@ module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLi
       }).length;
       const noDate = openDeals.filter(deal => !deal.follow_up_date).length;
       const blocked = openDeals.filter(deal => {
-        const days = getDaysSince(deal.updated_at || deal.created_at);
+        const days = getDaysSince(deal.created_at);
         return days !== null && days >= 8;
       }).length;
       const pipelineAlerts = { atRisk, noDate, blocked };
