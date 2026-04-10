@@ -324,25 +324,22 @@ module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLi
       const [debriefRes, dealsRes, usersRes] = await Promise.all([
         supabase
           .from('debriefs')
-          .select('id,user_id,user_name,prospect_name,call_date,is_closed,percentage,sections')
+          .select('*')
           .in('user_id', memberIds)
-          .order('call_date', { ascending: false })
           .limit(1600),
         supabase
           .from('deals')
-          .select('id,user_id,status,follow_up_date,created_at')
+          .select('*')
           .in('user_id', memberIds)
-          .order('created_at', { ascending: false })
           .limit(1600),
         supabase
           .from('users')
-          .select('id,name')
+          .select('id,name,email')
           .in('id', memberIds),
       ]);
 
       if (debriefRes.error) {
-        console.error('Manager summary debriefs query error:', debriefRes.error);
-        return res.status(500).json({ error: 'Erreur récupération debriefs manager' });
+        console.warn('Manager summary debriefs query warning (continuing with empty debriefs):', debriefRes.error);
       }
       if (dealsRes.error) {
         console.warn('Manager summary deals query warning (continuing with empty deals):', dealsRes.error);
@@ -351,7 +348,20 @@ module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLi
         console.warn('Manager summary users query warning (continuing with fallback names):', usersRes.error);
       }
 
-      const debriefs = debriefRes.data || [];
+      const debriefs = (debriefRes.error ? [] : (debriefRes.data || [])).map((row) => {
+        const totalScore = Number(row.total_score || 0);
+        const maxScore = Number(row.max_score || 0);
+        const rawPct = Number(row.percentage);
+        const computedPct = maxScore > 0 ? safeRound((totalScore / maxScore) * 100) : 0;
+        return {
+          ...row,
+          user_name: row.user_name || row.closer_name || '',
+          call_date: row.call_date || row.created_at || null,
+          is_closed: Boolean(row.is_closed),
+          percentage: Number.isFinite(rawPct) ? rawPct : computedPct,
+          sections: row.sections || {},
+        };
+      });
       const deals = dealsRes.error ? [] : (dealsRes.data || []);
       const users = usersRes.error ? [] : (usersRes.data || []);
   
@@ -396,7 +406,7 @@ module.exports = function registerAiRoutes(app, { authenticate, requireHOS, aiLi
       }).length;
       const pipelineAlerts = { atRisk, noDate, blocked };
   
-      const userNameById = new Map((users || []).map(user => [user.id, user.name]));
+      const userNameById = new Map((users || []).map(user => [user.id, user.name || user.email || 'Closer']));
       const byCloser = {};
       for (const debrief of currentWeekDebriefs) {
         if (!byCloser[debrief.user_id]) byCloser[debrief.user_id] = [];
